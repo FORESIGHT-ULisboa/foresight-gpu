@@ -1,0 +1,72 @@
+[build-system]
+requires = ["setuptools>=42", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "foresight-gpu"
+version = "0.1.0"
+description = "Generalized Pareto Uncertainty (GPU): a scikit-learn-style probabilistic regressor"
+readme = "README.md"
+license = { file = "LICENSE" }
+requires-python = ">=3.9"
+authors = [
+    { name = "FORESIGHT", email = "jose.matos@tecnico.ulisboa.pt" },
+]
+keywords = [
+    "uncertainty",
+    "probabilistic-forecasting",
+    "pareto",
+    "hydrology",
+    "streamflow",
+    "scikit-learn",
+    "multi-objective-optimization",
+]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = [
+    "numpy>=1.24",
+    "pandas>=2.0",
+    "scipy>=1.10",
+    "matplotlib>=3.7",
+    "scikit-learn>=1.3",
+    "joblib>=1.3",
+    "forecast-performance @ git+https://github.com/FORESIGHT-ULisboa/forecast_performance",
+]
+
+[project.urls]
+Homepage = "https://foresight.tecnico.ulisboa.pt/"
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0",
+    "pytest-cov>=4.0",
+    "jupyter>=1.0",
+    "ipykernel>=6.0",
+]
+# OpenCL backend is a documented overload point; kernels are not shipped yet.
+opencl = [
+    "pyopencl>=2023.1",
+]
+build = [
+    "build>=1.0",
+    "twine>=4.0",
+]
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["foresight_gpu*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-v"
+
+[tool.coverage.run]
+source = ["foresight_gpu"]
+omit = ["tests/*"]
+
+[tool.black]
+line-length = 88
