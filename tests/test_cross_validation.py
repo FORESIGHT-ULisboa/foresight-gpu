@@ -21,7 +21,6 @@ def data(rng):
 
 def test_cross_val_score_reliability(data):
     X, y = data
-    breakpoint()  # Debugging breakpoint
     est = GPURegressor(population=80, n_iter=15, random_state=0)
     scores = cross_val_score(
         est, X, y, cv=TimeSeriesSplit(3), scoring=reliability_scorer

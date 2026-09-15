@@ -19,8 +19,8 @@ from .metrics.probabilistic import (
 
 #: Default non-exceedance-probability levels (must lie strictly in (0, 1)).
 DEFAULT_QUANTILES = [
-    0.001, 0.01, 0.025, 0.05, 0.15, 0.25, 0.35, 0.45,
-    0.55, 0.65, 0.75, 0.85, 0.95, 0.975, 0.99, 0.999,
+0.01, 0.025, 0.05, 0.15, 0.25, 0.35, 0.45,
+0.55, 0.65, 0.75, 0.85, 0.95, 0.975, 0.99,
 ]
 
 

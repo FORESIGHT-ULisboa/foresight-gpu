@@ -1,0 +1,22 @@
+!!	----GENERAL----!!
+rivvel	0.9
+damp	0.8
+gratk	1.4
+srbeta	1
+sswcorr	0.66
+!!	zero row: multiply mode cannot move it
+deadpar	0
+!!	LANDUSE ----!! forest agriculture open
+cmlt	1.2	2.4	0.8
+ttmp	0.6	-3.2	2.5
+snalbmin	0.45	0.45	0.45
+cmrad	0.48	0.48	0.48
+!!	----PARAMETER REGION----!!
+preccorr	-0.1	0.2
+!!	----SOIL----!! coarse medium fine
+wcfc	0.137	0.152	0.038
+wcwp	0.069	0.099	0.023
+wcep	0.529	0.258	0.158
+rrcs1	0.538	0.475	0.502
+!!	srrate	0.24	0.25	0.16
+macfrac	1	1	1	1

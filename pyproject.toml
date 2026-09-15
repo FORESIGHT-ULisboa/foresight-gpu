@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "foresight-gpu"
-version = "0.1.0"
+version = "0.2.0"
 description = "Generalized Pareto Uncertainty (GPU): a scikit-learn-style probabilistic regressor"
 readme = "README.md"
 license = { file = "LICENSE" }
@@ -63,6 +63,9 @@ include = ["foresight_gpu*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 addopts = "-v"
+markers = [
+    "slow: needs a real HYPE executable; deselect with -m 'not slow'",
+]
 
 [tool.coverage.run]
 source = ["foresight_gpu"]

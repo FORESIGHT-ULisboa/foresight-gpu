@@ -16,14 +16,14 @@ The public interface is a **scikit-learn regressor**, so it drops into `Pipeline
 > documented overload point.
 
 > **New here?** Start with [`notebooks/00_quickstart.ipynb`](notebooks/00_quickstart.ipynb),
-> then the seasonal-forecast, custom-model and diagnostics notebooks.
+> then the seasonal-forecast, custom-model, diagnostics and HYPE notebooks.
 
 ## Features
 
 | Area | What you get |
 |---|---|
 | Estimator | `GPURegressor` — `fit` / `predict` (point) / `predict_quantiles` (bands), sklearn-compatible |
-| Forward models | tiny `MLPModel`, hydrological `GR4JModel`, or **bring your own** `BaseForwardModel` |
+| Forward models | tiny `MLPModel`, hydrological `GR4JModel`, external `HYPEModel` (SMHI HYPE executable, driven by your own forcing DataFrames), or **bring your own** `BaseForwardModel` |
 | Error metrics | `nse`, `kge`, `kge_prime`, `mae`, `mse`, `rmse` — fast, vectorised over the population, + Lp regularisation |
 | Uncertainty | `ParetoEnsemble` post-convergence estimator (inverse-CDF, band aggregation) |
 | Model selection | cross-validation, `GridSearchCV`, and **early stopping** on held-out reliability |
@@ -116,6 +116,8 @@ foresight_gpu/     core package — a general sklearn regressor
   estimator.py     GPURegressor
   ensemble.py      ParetoEnsemble (fitted artifact)
   models/          BaseForwardModel, MLPModel, GR4JModel
+    hype/          HYPEModel: the SMHI HYPE executable as a forward model,
+                   driven by forcing you pass in (DataFrames or file paths)
   metrics/         fast vectorised metrics + Lp regularisation + Renard diagnostics
   domination/      double-Pareto sorting (2 objectives; seam for >2)
   optimizers/      MOPSO

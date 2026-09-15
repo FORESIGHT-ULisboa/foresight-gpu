@@ -114,8 +114,118 @@ exact equivalence to the reference implementation with a test before removing th
   (higher = better) so they plug into `cross_val_score(..., scoring=...)` and `GridSearchCV`;
   they call `predict_quantiles` / `predictive_pvalues` (the default `make_scorer` only sees
   `predict`). The same callables back the early-stopping monitor.
-- Never shuffle internally; document `cv=TimeSeriesSplit(...)` for users.
+- Never shuffle internally. That is about the engine's own default (`shuffle=False`), not
+  about the user's choice of `cv`: two splitters answer two different questions, and both
+  are legitimate to document.
+  - `cv=TimeSeriesSplit(...)` estimates **forecast skill** — it never trains on the future,
+    but the earliest years are never tested and each fold trains on a growing prefix.
+  - `cv=KFold(k, shuffle=False)` gives k **contiguous blocks**: every part of the record is
+    tested once and every fold trains on ~(k−1)/k of it, which conditions the exceedance
+    axis better. It measures **record-wide consistency**, not forecast skill, and it is
+    mildly optimistic because the blocks touch (the day before a held-out block is a
+    training day, and recession memory spans days to weeks; `KFold` has no `gap=`). Carve
+    out a separate test block first if the headline number matters.
+  - `KFold(shuffle=True)` is the one to avoid for a daily series: each held-out day then
+    sits between two training days, and autocorrelation makes the score flattering.
 - `warm_start=True` continues the population across `fit` calls.
+
+## The HYPE model (`models/hype/`)
+
+HYPE is an external executable driven by a folder of text files, so it bends the contract in
+one documented way and is worth reading before touching it.
+
+- **The meteorology arrives via `forcing=`, not `X`.** `{"P": df, "T": df}` (DataFrame,
+  Series or path; aliases in `forcing.py::ALIASES`) is written into every worker folder in
+  HYPE's format, overlaying the template's own files, and the matching `read*obs` switch is
+  set in `info.txt`. Omitting it falls back to the folder's existing files — supported, but
+  then the data is invisible to the caller. `forcing.py` owns coercion, coverage/gap
+  validation (forcing must be complete; `Qobs`/`Xobs` may have gaps → `-9999`), and the
+  content digest. **The digest is part of the cache fingerprint** — the same parameters under
+  different weather give a different simulation, so `model.fingerprint_` mixes layout,
+  forcing, window and output selection.
+- **Observations arrive the same way.** `load_observations(source)` and
+  `HYPEModel.observations(source)` take a DataFrame, a Series or a path, so the observation
+  and forcing sides are symmetric. `observations` = load + window-trim in one call and knows
+  the model's `date_column`; `load_observations` cannot, so it always returns a width-1 `X`.
+  `-9999` becomes NaN. A column is **never guessed** when a frame has two or more.
+- **`align` keeps two arities; it is a row filter, not a loader.** `align(X)` returns one
+  array, `align(X, y)` two. A `y` that carries a `DatetimeIndex` is **joined on dates** (so
+  the two sides may come from different sources); anything else is positional and a length
+  mismatch raises. It is deliberately *not* overloaded to accept a lone DataFrame: the return
+  arity would then depend on the argument's runtime type, and an `X` that keeps its dates on
+  the index would be read as observations, calibrating against day ordinals. Use
+  `observations()` for the one-call route.
+  - The join preserves `X`'s **order and multiplicity** — sorting or de-duplicating would
+    change the effective weighting of the loss and of `eta`, and desynchronise any parallel
+    array the caller holds. Implemented with the same integer-offset lookup as
+    `resolve_indices`, so it is O(n) and safe on both sides.
+  - It warns **only** when in-window `X` rows have no observation. Observations outside `X`
+    are not a mismatch (`X` is routinely a deliberate subset), and a plain window trim is
+    this method's documented purpose — warning there would fire on every call and pollute
+    the `hype_observations` fixture.
+- **Window precedence**: explicit `bdate`/`edate` argument > span of the supplied
+  forcing > template `info.txt`. `cdate` is different: it is the *warmup boundary*, not a
+  period choice, so the template's value is kept whenever it still lies inside the window.
+  Supplying data must not silently discard the spin-up the template asked for — that is what
+  makes "no `forcing=`" and "`forcing=` holding the folder's own files" give identical
+  simulations, which is a test.
+- **Two silent-date traps, both guarded.** A positional (numeric) DataFrame index is refused:
+  pandas reads it as nanoseconds since 1970 and hands back a plausible-looking 1970 window. A
+  **tz-aware** index is refused too: day ordinals floor in UTC, so an `Asia/Tokyo` index
+  turns 2020-01-01 into 2019-12-31 with nothing to show it happened. `check_ordinals`
+  (`dates.py`) is called by both `resolve_indices` and `align`, so a scaled `X` raises instead
+  of silently filtering to zero rows.
+- **`X` carries dates, not features.** `X[:, date_column]` holds the `datetime64[D]` day
+  ordinal and `forward` returns the simulated value for exactly those dates. Day resolution
+  is required: float64 is exact to 2⁵³, so day ordinals (~2e4) round-trip but nanosecond ones
+  (~1.8e18) do not. Consequences: never place a scaler in front of the estimator (the dates
+  are destroyed outside it, where nothing can recover them — `forward` raises instead), and
+  keep `shuffle=False`.
+- **One continuous run per parameter set, cached.** `forward` slices rows out of a cached
+  full-window simulation. Sizing matters: `evolve` only re-evaluates new candidates, but an
+  early-stopping check forwards the *whole* population, mostly long-lived survivors, so
+  `cache_size` must exceed `(check_every + 1) × population` or checks stop being free.
+  `cache_size=0` disables it; a fresh run is quantised to the cache's float32 first so cached
+  and uncached results are bit-identical.
+- **Search space is the unit box**, via `search_transform` / `inverse_search_transform`.
+  `parameter_bounds` stays honest (physical values), but MOPSO's `c3` perturbation is
+  *absolute* (`mopso.py:90`), so a raw physical box would switch exploration off in the wide
+  dimensions. Use broadcasting (`np.where`), never boolean indexing: `inverse_search_transform`
+  is called on 1-D bounds and `search_transform` on 2-D populations.
+- **Run budget** — the whole cost model. Screening costs `screen_oversample × population`,
+  each generation `population`, each early-stopping check zero. Keep test budgets tiny.
+  **Cross-validation costs k× a full fit** (each fold `clone`s the model, so each gets its
+  own workspace *and* its own cache); but *scoring* a fitted model on any other window costs
+  **zero**, because the whole window is already simulated. So a held-out test block is free
+  and the folds are not.
+- **To plot or compare per-fold results, keep the arrays, not the models.** Each fold's
+  `gpu.model_` owns a temp workspace and `n_workers` processes, so it must be `close()`d as
+  soon as the fold is scored. Stash `predict_quantiles` / `predictive_pvalues` output inside
+  the fold loop instead — scoring a held-out block there is already free (the window is
+  cached), and the plots then neither cost a run nor depend on a live workspace.
+- **An under-resourced swarm degrades silently.** Measured on Tomar (8 parameters): at
+  population 24 × 8 generations the bands collapse onto one value, so `pi = 1/std` is `inf`,
+  a fifth of observations get no p-value, and `alpha` is computed from what is left — 0.23
+  with `xi` 0.03. At 40 × 15 the same setup gives `alpha` 0.75, `xi` 0.86, everything scored.
+  Nothing raises in the first case. Report `xi` and the finite-p-value fraction, not `alpha`
+  alone.
+- **`fit` runs a `clone`**, so the model instance the user passes never executes: read
+  counters and workspace off `estimator.model_`.
+- **Failed runs.** A NaN column scores non-exceedance *exactly* 0.0, and `DoubleParetoSorter`
+  ranks by exceedance coverage rather than loss dominance, so while the population is still
+  narrow a failure extends front 0 and survives selection with infinite crowding; once the
+  population has spread across the axis it is properly dominated. Hence `max_failure_fraction`
+  and the loud warning. **Open follow-up (core, not the model):** `_make_evaluate` should
+  exclude particles with non-finite simulations from ranking.
+- **Testing needs no HYPE.** `executable` accepts a full command, so `tests/hype_stub.py`
+  (invoked as `[sys.executable, stub]`) stands in for the exe and exercises the entire
+  pipeline including multiprocessing. Integration tests against a real folder read
+  `FORESIGHT_HYPE_FOLDER` and skip when unset. The stub and `tests/data/hype_template/` are a
+  matched pair: the stub reads `par_reference.txt` to measure each parameter as a ratio to
+  its default, reads `Pobs.txt` so a `forcing=` swap is observable (scaled by a *fixed*
+  nominal rainfall — normalising by the series' own mean would make it blind to the
+  magnitude of the forcing), and its level response saturates so a swarm can span the
+  exceedance axis.
 
 ## OpenCL overload
 
