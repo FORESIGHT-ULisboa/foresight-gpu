@@ -30,16 +30,33 @@ class MLPModel(BaseForwardModel):
         ``"leaky_relu"``.
     leaky_slope : float, optional
         Negative-side slope for ``leaky_relu``.
+    output_scale, output_offset : float, optional
+        Affine map applied to the network output: ``out * output_scale + output_offset``.
+
+        **This is how the MLP reaches a target it could not otherwise address.** Weights are
+        bounded at +/-30 in model space, so with ``n_hidden`` nodes and a bounded activation
+        the output tops out near ``30 * (n_hidden + 1)`` — about 270 by default — *whatever
+        the data looks like*. On a target near 1000 every particle then sits on the same side
+        of every observation, the exceedance axis degenerates, no band is populated and
+        ``predict`` returns all-NaN, silently. Measured: NSE 0.28 with the scaling, -12403 at
+        a target mean of 100, no prediction at all at 1000.
+
+        Because the output layer is linear, this is exactly a reparameterisation of it
+        (``sigma * (w.h + b) + mu``), so it is a plain hyperparameter — no fitted state, and
+        reachable as ``model__output_scale`` in a search. The usual setting is::
+
+            MLPModel(output_scale=y.std(), output_offset=y.mean())
+
+        Inputs are **not** scaled here; use a ``Pipeline`` for those.
     """
 
-    # The MLP searches weights in a normalised space, so scale inputs and outputs.
-    scales_inputs = True
-    scales_outputs = True
-
-    def __init__(self, n_hidden=8, activation="tanh", leaky_slope=0.01):
+    def __init__(self, n_hidden=8, activation="tanh", leaky_slope=0.01,
+                 output_scale=1.0, output_offset=0.0):
         self.n_hidden = n_hidden
         self.activation = activation
         self.leaky_slope = leaky_slope
+        self.output_scale = output_scale
+        self.output_offset = output_offset
 
     def n_parameters(self, n_features):
         return (n_features + 2) * self.n_hidden + 1
@@ -95,4 +112,4 @@ class MLPModel(BaseForwardModel):
         activated = self._activate(hidden)
         # linear output: [P, n_samples]
         out = np.einsum("pnh,ph->pn", activated, w_output) + b_output[:, None]
-        return out.T  # [n_samples, n_particles]
+        return out.T * self.output_scale + self.output_offset  # [n_samples, n_particles]

@@ -26,6 +26,11 @@ convenience-only (feature engineering, screening heuristics, plotting) is a *hel
 lives under `foresight_gpu/utils/`. `GPURegressor` must be usable on plain arrays with no
 domain code.
 
+**The estimator scales nothing.** Since 0.5.0 there is no `StandardScaler` inside `fit`:
+normalise `X` with a `Pipeline`, and if a model's parameter bounds cannot reach the target's
+range, say so on the model (`MLPModel(output_scale=, output_offset=)`). See the forward-model
+contract below.
+
 ## Architecture (who owns what)
 
 The one idea that shapes everything: **the optimiser owns the model parameters; the model
@@ -38,7 +43,7 @@ GPURegressor (estimator)                 foresight_gpu/estimator.py
   ├─ model: BaseForwardModel             foresight_gpu/models/      (MLPModel, GR4JModel, byo)
   ├─ optimizer: BaseOptimizer            foresight_gpu/optimizers/  (MOPSO)
   ├─ metric: Metric (training loss)      foresight_gpu/metrics/
-  ├─ DominanceSorter (Pareto ranking)    foresight_gpu/domination/
+  ├─ DominanceSorter + hypervolume       foresight_gpu/domination/  (ranking & indicators)
   ├─ crowding (NSGA-II)                  foresight_gpu/crowding.py
   ├─ scoring (early stop / CV)           foresight_gpu/scoring.py
   └─ ensemble_: ParetoEnsemble (fitted)  foresight_gpu/ensemble.py
@@ -63,6 +68,28 @@ that does the band aggregation and inverse-CDF prediction.
 - `regularizable_mask(n_features) -> bool[]` — which parameters the Lp term penalises.
 - Optional `search_transform` / `inverse_search_transform` — a per-model search-space
   warp (the MLP uses `(w/4)**5`; GR4J uses identity). Do **not** put this on the engine.
+
+**The model owns its units.** `forward` returns simulations directly comparable with `y`;
+nothing rescales either side. `scales_inputs` / `scales_outputs` were **removed in 0.5.0** —
+they were policy living in the estimator, and only ever one model used them. `fit` warns if a
+model still carries them so the change cannot be silent.
+
+- **`X`**: the caller's job, via `Pipeline([StandardScaler(), GPURegressor(...)])`. (Not for
+  HYPE — `X` holds dates there; see that section.)
+- **`y`**: out of `Pipeline`'s reach, and `TransformedTargetRegressor` is not a substitute —
+  it exposes no `predict_quantiles`, and its `fit(X, y, **fit_params)` would forward
+  `X_val`/`y_val` untransformed while the regressor trains on scaled `y`. So the *model*
+  carries it: `MLPModel(output_scale=y.std(), output_offset=y.mean())`.
+- **Why the MLP needs it at all.** Its weights are bounded at ±30 in model space, so with
+  `n_hidden` nodes the output tops out near `30·(n_hidden+1)` — about 270 by default —
+  whatever the data looks like. Measured: NSE 0.28 with the affine map, **−12403** at a
+  target mean of 100, and at 1000 **no prediction at all** (every particle on one side of
+  every observation → exceedance axis collapses → no band populated → `predict` all-NaN).
+  Because the output layer is linear this is exactly a reparameterisation of it
+  (`σ·(w·h + b) + μ`), so it is a plain hyperparameter — no fitted state, reachable as
+  `model__output_scale` in a search.
+- `fit` warns when the final population's exceedance span is **exactly zero**, which is that
+  all-NaN failure. Guarded on an exactly-zero span so it cannot fire on a merely narrow front.
 
 ## Metrics (`metrics/`)
 
@@ -89,6 +116,130 @@ array shape is the seam for a future N-objective sorter. The sorter runs every g
 on ~2× the population, so it is a hot path; keep it fast and, if you optimise it, prove
 exact equivalence to the reference implementation with a test before removing the old one.
 
+**Front 0 is η-ordered and V-shaped.** `_double_pareto` consumes points in ascending loss and
+only ever *extends* the span, so front 0 comes back sorted along η with the loss falling
+monotonically to the anchor and rising after it (verified on 500/500 random populations).
+Everything in `hypervolume.py` rests on this.
+
+### Hypervolume (`domination/hypervolume.py`)
+
+The front-quality indicator that drives early stopping. Two readings of one quantity:
+minimise `D = ∫_covered L(η)dη + P·(uncovered span)`, or maximise the area between the
+staircase and a ceiling at `P`. They are algebraically identical (`HV = P − D`), so **`P` is
+the price of a unit of uncovered exceedance**. Reported as `hv = 1 − D/P ∈ [0,1]`, higher =
+better, to match the `scoring` contract.
+
+- **The computation lives on `ParetoEnsemble`, not the estimator.** `score_hypervolume(X, y,
+  metric=None, *, penalty, interpolation, details)` and
+  `front_objectives(X, y, metric=None) -> (eta, loss, front)` are the public surface. The
+  ensemble already carries the whole population and the model, so the only
+  thing it was ever missing was the metric — and that is a **parameter**, with the
+  calibration metric stored as an overridable default. A front calibrated on NSE can
+  therefore be re-read under KGE or MAE with no refit, and `"hypervolume"` is a normal
+  `score_ensemble` option rather than a special case. Plotting should use
+  `front_objectives`; nothing needs privates.
+- **Always pass the raw loss; `hv_space` picks the axis.** The loss is computed from the
+  simulations, so the Lp term (which penalises parameters, not held-out fit) cannot reach it
+  by construction.
+  - `"linear"` (default): clip to `[0, P]`, box `P`. Unchanged from 0.4.0.
+  - `"log10"`: clip `log10(loss)` to `[−P, +P]`, box `2P`. **Symmetric**, so `P` is read as a
+    bound on `|log10 L|` — `P=2` is raw loss in `[1e-2, 1e2]` — and no second parameter is
+    needed. A front at loss 1 everywhere (the no-skill line) scores exactly `hv = 0.5`, which
+    is what makes the number readable.
+  - **Why offer it.** Linear space spends almost the whole box on losses nobody cares about:
+    at `P=100` the region of interest (losses of order 1) is a hundredth of the axis. Measured
+    on the synthetic problem in `02_diagnostics`, the usable `hv` range is **2–7× wider** in
+    log10 (2.3× over one run's early-stopping trace, 6.9× over converged fronts at 5…160
+    generations). The factor depends on which fronts are compared; the direction does not.
+  - **This is not the sorter's `log10`.** That one is floored at `tiny`, unbounded below and
+    carries the `_BAD_LOSS` sentinel; integrating it is meaningless. The bound here is the
+    symmetric clip. Every registry metric has `Metric.loss ≥ 0` with optimum exactly 0, so
+    `log10` is defined everywhere except at 0 — and loss 0 clips to the floor `−P`, taking
+    maximum credit, which is correct.
+  - `log10` is monotone, so **front 0 is identical in both spaces**; the transform is applied
+    after front selection and a precomputed `front=` stays valid.
+  - The two spaces need `P` orders of magnitude apart, so `hv_penalty` now defaults to `None`
+    and resolves per space: `DEFAULT_HV_PENALTY` (100.0) or `DEFAULT_HV_LOG_PENALTY` (2.0).
+    Under `log10`, `"climatology"` is taken into log units — which for every
+    `greater_is_better` metric is `log10(1.0) = 0`, not a usable ceiling, so it falls through
+    the existing non-positive guard and warns.
+- **`front_objectives` drops rows where *either* `X` or `y` is non-finite.** `_simulate`
+  masks only `X`; one NaN in `y` makes `metric.loss` NaN for every particle, clipping them
+  all to `P` and reporting `hv == 0` silently. The estimator path got this free from
+  `prepare_arrays`; the `cross_val_score` path does not.
+- **The staircase height is `max(lᵢ, lᵢ₊₁)`, and that is forced, not chosen.** It is what
+  makes the O(m) closed form equal the standard split-half hypervolume (matched to 2.2e-16
+  over 2000 random fronts; the `min` rule is off by up to 0.84). `test_step_equals_split_hypervolume`
+  is that proof as an executable test — **keep it green**, same discipline as the
+  domination-equivalence test. `interpolation="linear"` is an optimistic trapezoidal
+  smoothing with no hypervolume interpretation, 1 loss axis only.
+- Losses clip to `[F, P]` (`F = 0` linear, `−P` log10). A particle worse than `P` is no
+  better than a gap, and failed particles (non-finite loss, η exactly 0.0) clip to `P` and
+  contribute **zero area** — they lengthen the covered span at zero height. That partly
+  answers the failed-run follow-up below, though the *ranking* path is still open.
+- **`clipped_fraction` makes a too-tight `P` visible.** Clipping is the intended semantics —
+  no gradient among models you would never use — but past some share of the front the
+  indicator simply stops responding, and that was previously invisible. The share of front-0
+  at the ceiling (failed particles included) is reported in `details` and therefore lands in
+  `history_` next to `coverage`; `score_hypervolume` warns above `HV_CLIP_WARN_FRACTION`
+  (0.25). Measured at the NSE climatology ceiling `P=1`: **~0.8–0.9 of front-0 clipped**, `hv`
+  ~0.01 against ~0.98 at `P=100` — the same worse-than-climatology figure that motivated the
+  constant default, now reported instead of inferred. The clean demonstration is a
+  low-variance validation window (`02_diagnostics`): it inflates every loss at once while
+  `coverage` stays at 1.00, so `clipped_fraction` is the only thing that moves. A plain bias
+  moves `coverage` instead — the front keeps some high-η particle that tracks the shift.
+- **`P` defaults to the constant `DEFAULT_HV_PENALTY = 100.0`, deliberately not a
+  climatology.** GPU's extreme-η particles are *meant* to be biased — a particle at η≈0.95
+  has to systematically over-predict to get there, so its NSE is necessarily poor. Measured
+  on a real front, **80% of front-0 scores worse than climatology** (loss quartiles
+  `[0.81, 1.10, 1.64, 2.21, 6.36]`). A ceiling at 1.0 clips exactly those to zero
+  contribution, making the indicator blind to the particles that give the distribution its
+  width; P=100 measured a *larger* usable range (5.4e-2 vs 2.7e-2). `hv_penalty` takes a
+  float or `"climatology"`; `hv_penalty_scale` now multiplies 100, not 1.
+  - **`P` must be resolved once and frozen** — `hv = 1 − D/P` is only comparable between
+    checks if it is the same box both times. A `P` tracking the worst particle was
+    considered and is *fatal*: on a front that never changes, hv goes 0.50 → 0.75 → 0.875 →
+    0.975 as P grows 1 → 2 → 4 → 20, so the monitor would report improvement whenever the
+    swarm found something worse, and reset patience each time.
+  - `ParetoEnsemble.score_hypervolume` warns on two rungs: **the whole front above `P`**
+    (`hv` pinned at 0, no gradient to stop on), else **more than `HV_CLIP_WARN_FRACTION` of
+    it**. Neither fires on individual tail particles above `P` — that is the normal regime
+    and would fire on healthy runs. Both texts are constant across checks so Python's dedup
+    emits each once per fit, not once per generation.
+- **`default_hv_penalty(metric, obs, predictor)`** is what `hv_penalty="climatology"` reaches
+  for: `1.0` for `greater_is_better` metrics (`loss = 1 − value` is dimensionless, so this is
+  the metric-value-0 no-skill line), otherwise the constant-predictor loss (`var` for MSE,
+  `std` for RMSE, `mean|y−μ|` for MAE). The two branches are one rule — `NSE = 1 − MSE/var(y)`,
+  so `nse.loss == mse.loss / default_hv_penalty(mse, y)`; the constant-predictor loss *is*
+  NSE's denominator. It touches only the generic `Metric` contract and names no metric, so
+  `domination/` stays free of metric knowledge. **Do not** just call `metric.loss(const, y)`:
+  a constant series has zero variance, so Pearson r is 0/0 and KGE′ γ is x/0, and the result
+  is `nan` or ~1e15 *depending on whether `mean()` leaves a 2e-16 residue* — not even
+  deterministic in kind.
+- **Drawing it: `utils/plotting.py::plot_hypervolume(eta, loss, penalty, ...)`.** Takes the
+  `(eta, loss, front)` tuple `front_objectives` returns and covers all four cases
+  (`space` x `interpolation`). It **recomputes `hv` from the same call it draws from** and puts
+  it in the title, so the picture and the number cannot drift apart — which they had, in
+  notebook 02: the figure reported `interpolation="linear"` while shading the step staircase.
+  `test_plot_hypervolume_title_matches_the_indicator` is the lock; keep it green.
+  - `space="log10"` draws raw loss on a log axis. That is not cosmetic: a straight polyline
+    between two points on a log axis has the geometric mean as its per-cell average, which is
+    exactly what `interpolation="linear"` integrates in log space, and `max` is monotone — so
+    one construction is faithful in both spaces.
+  - The figure **marks the anchor** rather than hiding it. In `step` mode every cell takes
+    `max(l_i, l_i+1)`, which on a V-shaped front is always the *outer* endpoint, so the
+    lowest-loss particle is the one point the boundary never touches. Its cell has zero width:
+    the single best model on the front contributes no area at all. That is correct geometry,
+    and it is why `hv` is a tails-and-shoulders measure — "hv improved" never means "my best
+    model got better".
+
+- **N objectives.** `double_pareto_hypervolume` splits at the anchor into η ≤ s and η ≥ s,
+  negates η on the right half and sums two standard `hypervolume()` calls; the halves are
+  disjoint in η so the sum is exact for any number of loss axes. Two alternatives are
+  recorded as rejected in the module docstring, with counterexamples: joining consecutive
+  front points per η cell is **non-monotone** (one mediocre point collapses it 100×), and
+  choosing the split by maximising the total **over-credits**. The split must be the anchor.
+
 ## scikit-learn conventions
 
 - `__init__` **only stores parameters** as same-named attributes — no validation, no work.
@@ -104,16 +255,60 @@ exact equivalence to the reference implementation with a test before removing th
 ## Cross-validation & early stopping
 
 - **`metric` vs `scoring` are different roles.** `metric` is the per-particle *training*
-  loss driving the Pareto front. `scoring` is the held-out *probabilistic* criterion for
-  early stopping and model selection. Keep both.
-- Early stopping mirrors `MLPRegressor`/`HistGradientBoosting`: a chronological validation
-  tail (`shuffle=False` by default — correct for time series), monitored every
-  `check_every` generations with `scoring`, stopping after `n_iter_no_change` checks without
-  improvement > `tol`, restoring the best ensemble.
+  loss driving the Pareto front. `scoring` is the held-out criterion for early stopping and
+  model selection. Keep both.
+- **Early stopping is inferred from the data, never flagged.** There is no `early_stopping`
+  parameter — it runs whenever validation data exists, which leaves no contradictory state
+  to warn about:
+
+  | call | early stopping |
+  |---|---|
+  | `fit(X, y)` | off — full `n_iter`, whole record trains |
+  | `GPURegressor(validation_fraction=0.2).fit(X, y)` | on, internal chronological tail |
+  | `fit(X, y, X_val=Xv, y_val=yv)` | on, the caller's split; **all** of `X` trains |
+
+  `validation_fraction` defaults to `None` for exactly this reason: at `0.1` it would switch
+  early stopping on for every caller. Passing both is the one ambiguity — explicit data wins
+  with a `UserWarning`. The resolved state is the fitted `early_stopping_`. Splitting outside
+  the estimator is the point: a water year, a gauge or a `TimeSeriesSplit` fold can now drive
+  it. `X_val` follows the training NaN policy exactly (rows with non-finite `X` dropped by
+  `prepare_arrays`; a non-finite `y` raises in `check_X_y`, for training and validation
+  alike).
+- **`cross_val_score` / `GridSearchCV` do not slice `X_val` per fold.** Passing it through
+  `fit_params` hands every fold the same block, which for a time series means later folds
+  train on data the "validation" block precedes. Inside CV, set `validation_fraction` so each
+  fold carves its own tail. Under `sklearn.set_config(enable_metadata_routing=True)` these
+  also become routable params that must be requested.
+- **The default `scoring` is `"hypervolume"`** (see the Domination section). It scores the
+  population *front* re-evaluated on held-out data, not the aggregated ensemble — the
+  training front only ever improves, so it cannot detect overfitting. It is bounded in
+  `[0, 1]`, and it removes the optional `forecast_performance` dependency from the default
+  path (`"crps"` raises `ImportError` without it). `"reliability"` alone was the thing this
+  replaces: a population can cut CRPS sharply while alpha sits still, and vice versa.
+- Mechanics: monitored every `check_every` generations, stopping after `n_iter_no_change`
+  checks without improvement > `tol`, restoring the best ensemble (`shuffle=False` by
+  default — correct for time series). Two deviations:
+  - `fit` builds the ensemble at **every** check (it needs `score_hypervolume(details=True)`
+    for `history_`, since the scorer contract returns a float). Benchmarked cost-neutral:
+    108.23 → 108.56 ms per check at population 1000 / n_val 600, of which `model.forward` is
+    103 ms and `make_ensemble` 0.42 ms. (Measured at 0.4.0, when a further 0.11 ms went on
+    `x_scaler.transform`; 0.5.0 removed that step.)
+  - While the hypervolume is still exactly `0.0` the patience counter is **held**: a swarm
+    that has not beaten the ceiling anywhere has no gradient to stop on, and
+    `n_iter_no_change` flat checks would otherwise stop it at generation
+    `check_every × n_iter_no_change`. The guard is gated on the hypervolume path —
+    `"crps"` is a negated score, measured −2.18 … −0.41, so an ungated guard would mean a
+    CRPS fit never stops (`test_negative_scorers_still_stop`).
 - Probabilistic scorers live in `scoring.py` with the `scorer(estimator, X, y)` signature
   (higher = better) so they plug into `cross_val_score(..., scoring=...)` and `GridSearchCV`;
   they call `predict_quantiles` / `predictive_pvalues` (the default `make_scorer` only sees
-  `predict`). The same callables back the early-stopping monitor.
+  `predict`). The same callables back the early-stopping monitor. **All four go through
+  `score_ensemble`**; `"hypervolume"` branches *before* `predict_quantiles`, since it needs
+  neither the bands nor the p-values, which makes it the cheapest of the four. The ensemble
+  carries `metric`, the resolved `hv_penalty` and `hv_interpolation`, so a scorer reaching it
+  through `GridSearchCV` honours the configuration instead of silently defaulting.
+  `GPURegressor.score_hypervolume` is a thin delegate to `ensemble_` — which means it scores
+  the front kept after a rollback, i.e. the one `predict` uses, not the final generation.
 - Never shuffle internally. That is about the engine's own default (`shuffle=False`), not
   about the user's choice of `cv`: two splitters answer two different questions, and both
   are legitimate to document.
@@ -193,7 +388,13 @@ one documented way and is worth reading before touching it.
   dimensions. Use broadcasting (`np.where`), never boolean indexing: `inverse_search_transform`
   is called on 1-D bounds and `search_transform` on 2-D populations.
 - **Run budget** — the whole cost model. Screening costs `screen_oversample × population`,
-  each generation `population`, each early-stopping check zero. Keep test budgets tiny.
+  each generation `population`, each early-stopping check zero — but that last one is
+  conditional, not automatic. Every monitor re-evaluates the whole population on the
+  validation window: the ensemble scorers through `predict_quantiles`, `"hypervolume"`
+  through `ensemble._simulate`, which is the same second `forward` pass. It stays free only while that window sits inside the
+  cached run, so keep `cache_size > (check_every + 1) × population` **and** keep `X_val`
+  inside the model window. `test_early_stopping_checks_cost_no_runs` pins both monitors at
+  zero. Keep test budgets tiny.
   **Cross-validation costs k× a full fit** (each fold `clone`s the model, so each gets its
   own workspace *and* its own cache); but *scoring* a fitted model on any other window costs
   **zero**, because the whole window is already simulated. So a held-out test block is free
@@ -216,7 +417,9 @@ one documented way and is worth reading before touching it.
   narrow a failure extends front 0 and survives selection with infinite crowding; once the
   population has spread across the axis it is properly dominated. Hence `max_failure_fraction`
   and the loud warning. **Open follow-up (core, not the model):** `_make_evaluate` should
-  exclude particles with non-finite simulations from ranking.
+  exclude particles with non-finite simulations from ranking. The *hypervolume* already
+  neutralises them — η exactly 0.0 plus a non-finite loss clips to `P` and contributes zero
+  area — so the monitor is not fooled; the ranking path still is.
 - **Testing needs no HYPE.** `executable` accepts a full command, so `tests/hype_stub.py`
   (invoked as `[sys.executable, stub]`) stands in for the exe and exercises the entire
   pipeline including multiprocessing. Integration tests against a real folder read
@@ -261,4 +464,19 @@ leak into the engine.
 - Metrics validated against `forecast_performance`. Plotting tests run **headless**
   (`matplotlib.use("Agg")`), inspecting `fig`/axes/artists rather than rendering.
 - Keep the sklearn estimator checks, the "three calling styles agree" metric tests, the CV
-  and early-stopping tests, and the domination-equivalence test green.
+  and early-stopping tests, the domination-equivalence test, and the hypervolume reduction
+  test (`test_step_equals_split_hypervolume`) green.
+- **Known pre-existing failure:** `tests/test_cross_validation.py::test_cross_val_score_reliability`
+  pins `EXPECTED_RELIABILITY_SCORE` to values ~1e-3 away from what this environment produces.
+  It fails identically on `74d5d4b`, byte for byte, so it is an environment-pinning issue,
+  not a regression. It was useful as a control when refactoring the training path; note that
+  since 0.5.0 it now differs for **two** reasons — the environment, and the removal of the
+  default MLP's scaling — so it is no longer a clean control. `EXPECTED_R2_SCORE` in the same
+  file was re-pinned in 0.5.0 for the second reason alone.
+
+
+## Important Notes
+
+- The legacy code that this project was based on was validated for a long time and is considered reliable. Being so when you are using it you should not assume that any errors should be solved with wrapping the legacy code with a lot of fall backs.
+
+- The same is applicable to the new code, you should not invent if you are unsure of how to do things, and you instead ask for help.

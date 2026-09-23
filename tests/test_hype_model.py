@@ -22,11 +22,6 @@ class TestContract:
         assert isinstance(hype_model, BaseForwardModel)
         assert not hasattr(hype_model, "fit")
 
-    def test_does_not_scale_inputs_or_outputs(self, hype_model):
-        # X holds dates (nothing to normalise) and HYPE already returns m3/s.
-        assert hype_model.scales_inputs is False
-        assert hype_model.scales_outputs is False
-
     def test_parameter_count_is_independent_of_n_features(self, hype_model):
         assert hype_model.n_parameters(1) == hype_model.n_parameters(7)
 

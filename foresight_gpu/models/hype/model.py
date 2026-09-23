@@ -156,9 +156,6 @@ class HYPEModel(BaseForwardModel):
     ``GridSearchCV`` fold from leaking state into the next.
     """
 
-    scales_inputs = False
-    scales_outputs = False
-
     def __init__(self, template_dir=None, forcing=None, bdate=None, cdate=None, edate=None,
                  parameters=None, model_options=None, parameter_specs=None,
                  subbasin=None, output_variable="cout", output_file=None,

@@ -95,6 +95,51 @@ class TestPipeline:
         pipe.fit(X, y)
         assert pipe.predict(X).shape == (X.shape[0],)
 
+    def test_pipeline_is_now_the_route_for_input_scaling(self, data):
+        """0.5.0: the estimator scales nothing, so the scaler has to be the caller's.
+
+        The pipeline's StandardScaler is the only thing standing between raw X and the
+        model, and it must survive predict as well as fit.
+        """
+        X, y = data
+        offset = X + np.array([500.0, -300.0])   # far outside the model's comfortable range
+        pipe = Pipeline(
+            [("scale", StandardScaler()),
+             ("gpu", GPURegressor(population=120, n_iter=20, random_state=0))]
+        ).fit(offset, y)
+        assert np.isfinite(pipe.predict(offset)).all()
+        assert not hasattr(pipe[-1], "x_scaler_")   # nothing scales inside the estimator
+
+    def test_target_range_is_the_models_business(self, data):
+        """y is out of Pipeline's reach, so it is expressed on the model instead."""
+        from foresight_gpu.models import MLPModel
+
+        X, y = data
+        big = y * 50.0 + 2000.0
+        pipe = Pipeline(
+            [("scale", StandardScaler()),
+             ("gpu", GPURegressor(
+                 model=MLPModel(output_scale=big.std(), output_offset=big.mean()),
+                 population=120, n_iter=20, random_state=0))]
+        ).fit(X, big)
+        pred = pipe.predict(X)
+        assert np.isfinite(pred).all()
+        assert abs(np.mean(pred) - big.mean()) < 0.5 * big.std()
+
+    def test_gridsearch_reaches_the_output_range(self, data):
+        from sklearn.model_selection import GridSearchCV, TimeSeriesSplit
+
+        from foresight_gpu.models import MLPModel
+        from foresight_gpu.scoring import make_gpu_scorer
+
+        X, y = data
+        search = GridSearchCV(
+            GPURegressor(model=MLPModel(), population=60, n_iter=8, random_state=0),
+            {"model__output_scale": [1.0, float(np.std(y))]},
+            cv=TimeSeriesSplit(2), scoring=make_gpu_scorer("hypervolume"),
+        ).fit(X, y)
+        assert "model__output_scale" in search.best_params_
+
 
 class TestWarmStart:
     def test_warm_start_runs_and_retains_population(self, data):

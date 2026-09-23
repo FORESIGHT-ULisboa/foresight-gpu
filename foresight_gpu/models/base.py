@@ -26,12 +26,15 @@ DEFAULT_BOUND = 30.0
 
 
 class BaseForwardModel(BaseEstimator, ABC):
-    """Abstract deterministic forward model evaluated over a particle swarm."""
+    """Abstract deterministic forward model evaluated over a particle swarm.
 
-    #: Whether the estimator should StandardScaler-normalise the inputs for this model.
-    scales_inputs = False
-    #: Whether model outputs are in a normalised space and must be inverse-transformed.
-    scales_outputs = False
+    **The model owns its own units.** ``forward`` must return simulations directly
+    comparable with ``y``; the estimator does no scaling on either side. Normalise ``X``
+    with a scikit-learn ``Pipeline``, and if a model's parameter bounds cannot reach the
+    target's range, express that as model hyperparameters (see
+    :class:`~foresight_gpu.models.MLPModel`'s ``output_scale`` / ``output_offset``) rather
+    than expecting the estimator to rescale.
+    """
 
     @abstractmethod
     def n_parameters(self, n_features):
