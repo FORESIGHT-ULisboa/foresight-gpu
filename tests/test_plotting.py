@@ -6,7 +6,13 @@ import pytest
 from matplotlib.axes import Axes
 
 from foresight_gpu import GPURegressor
-from foresight_gpu.utils import plot_double_pareto_front, plot_qq, plot_timeseries
+from foresight_gpu import double_pareto_hypervolume
+from foresight_gpu.utils import (
+    plot_double_pareto_front,
+    plot_hypervolume,
+    plot_qq,
+    plot_timeseries,
+)
 
 
 @pytest.fixture(scope="module")
@@ -58,12 +64,71 @@ def test_plot_double_pareto_front_with_masks():
     plt.close("all")
 
 
-def test_shared_axes_compose(fitted):
+@pytest.fixture(scope="module")
+def front(fitted):
     gpu, X, y = fitted
-    fig, axes = plt.subplots(1, 3, figsize=(12, 3))
+    return gpu.ensemble_.front_objectives(X, y)
+
+
+def test_plot_hypervolume(front):
+    eta, loss, idx = front
+    ax = plot_hypervolume(eta, loss, 10.0, front=idx)
+    assert isinstance(ax, Axes)
+    assert len(ax.collections) > 0  # the two fill_between regions
+    assert ax.get_xlim() == (0.0, 1.0)
+    plt.close("all")
+
+
+def test_plot_hypervolume_interpolations_differ(front):
+    """step and linear must draw different boundaries -- reporting one while drawing the
+    other is the bug this helper replaces."""
+    eta, loss, idx = front
+    data = {}
+    for interpolation in ("step", "linear"):
+        ax = plot_hypervolume(eta, loss, 10.0, front=idx, interpolation=interpolation)
+        data[interpolation] = ax.get_lines()[0].get_xydata().shape
+        plt.close("all")
+    assert data["step"] != data["linear"]
+
+
+def test_plot_hypervolume_log_space(front):
+    eta, loss, idx = front
+    ax = plot_hypervolume(eta, loss, 2.0, front=idx, space="log10")
+    assert ax.get_yscale() == "log"
+    plt.close("all")
+
+
+@pytest.mark.parametrize("space,penalty", [("linear", 10.0), ("log10", 2.0)])
+@pytest.mark.parametrize("interpolation", ["step", "linear"])
+def test_plot_hypervolume_title_matches_the_indicator(front, space, penalty,
+                                                      interpolation):
+    """The figure and its number come from one call, and must stay that way."""
+    eta, loss, idx = front
+    ax = plot_hypervolume(eta, loss, penalty, front=idx, space=space,
+                          interpolation=interpolation)
+    expected = double_pareto_hypervolume(
+        np.column_stack([eta, loss]), penalty, space=space,
+        interpolation=interpolation, front=idx,
+    )
+    assert float(ax.get_title().split("hv = ")[1]) == pytest.approx(expected, abs=5e-5)
+    plt.close("all")
+
+
+def test_plot_hypervolume_degenerate_front():
+    """A single front point spans no eta; it must draw rather than raise."""
+    ax = plot_hypervolume(np.array([0.5]), np.array([0.2]), 1.0, front=[0])
+    assert isinstance(ax, Axes)
+    plt.close("all")
+
+
+def test_shared_axes_compose(fitted, front):
+    gpu, X, y = fitted
+    eta, loss, idx = front
+    fig, axes = plt.subplots(1, 4, figsize=(16, 3))
     plot_double_pareto_front(gpu._fit[:, 0], gpu._fit[:, 1], ax=axes[0])
     plot_qq(gpu.predictive_pvalues(X, y), ax=axes[1])
     plot_timeseries(gpu.predict_quantiles(X[:100]), gpu.ensemble_.quantiles,
                     observed=y[:100], ax=axes[2])
+    plot_hypervolume(eta, loss, 10.0, front=idx, ax=axes[3])
     assert all(isinstance(a, Axes) for a in axes)
     plt.close("all")

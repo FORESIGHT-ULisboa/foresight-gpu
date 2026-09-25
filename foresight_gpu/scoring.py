@@ -6,6 +6,10 @@ They follow the sklearn scorer contract ``scorer(estimator, X, y) -> float`` wit
 better**, so they drop straight into ``cross_val_score(..., scoring=...)`` and
 ``GridSearchCV``. The same logic backs the estimator's internal early-stopping monitor via
 :func:`score_ensemble`.
+
+All four go through :func:`score_ensemble`. ``"hypervolume"`` reads the fitted **front**
+(:meth:`ParetoEnsemble.score_hypervolume`) rather than the aggregated bands, which is why
+it branches before ``predict_quantiles`` is ever called.
 """
 
 import numpy as np
@@ -16,12 +20,21 @@ from .metrics.probabilistic import predictive_pvalues, reliability, renard_metri
 def score_ensemble(ensemble, X, y, scoring="crps"):
     """Score a :class:`ParetoEnsemble` on held-out data (higher = better).
 
-    ``scoring`` may be ``"reliability"`` (Renard alpha), ``"resolution"`` (pi),
-    ``"crps"`` (negated, via ``forecast_performance``) or a callable
-    ``scoring(ensemble, X, y) -> float``.
+    ``scoring`` may be ``"hypervolume"`` (the double-Pareto front indicator, in
+    ``[0, 1]``), ``"reliability"`` (Renard alpha), ``"resolution"`` (pi), ``"crps"``
+    (negated, via ``forecast_performance``) or a callable ``scoring(ensemble, X, y) -> float``.
+
+    ``"hypervolume"`` uses the metric, ceiling, interpolation and objective space the
+    ensemble was built with; call :meth:`ParetoEnsemble.score_hypervolume` directly to
+    override any of them.
     """
     if callable(scoring):
         return float(scoring(ensemble, X, y))
+
+    # Before predict_quantiles on purpose: the front indicator needs neither the aggregated
+    # bands nor the p-values, so branching here keeps it the cheapest of the four.
+    if scoring == "hypervolume":
+        return float(ensemble.score_hypervolume(X, y))
 
     y = np.asarray(y, dtype=float).ravel()
     agg = ensemble.predict_quantiles(X)
@@ -34,7 +47,8 @@ def score_ensemble(ensemble, X, y, scoring="crps"):
     if scoring == "crps":
         return -float(_crps(ensemble, agg, y))
     raise ValueError(
-        f"Unknown scoring {scoring!r}; use 'reliability', 'resolution', 'crps' or a callable."
+        f"Unknown scoring {scoring!r}; use 'hypervolume', 'reliability', 'resolution', "
+        f"'crps' or a callable."
     )
 
 
@@ -69,7 +83,13 @@ def crps_scorer(estimator, X, y):
     return score_ensemble(estimator.ensemble_, X, y, "crps")
 
 
+def hypervolume_scorer(estimator, X, y):
+    """Double-Pareto hypervolume of the fitted ensemble's front, in ``[0, 1]``."""
+    return score_ensemble(estimator.ensemble_, X, y, "hypervolume")
+
+
 _SCORERS = {
+    "hypervolume": hypervolume_scorer,
     "reliability": reliability_scorer,
     "resolution": resolution_scorer,
     "crps": crps_scorer,

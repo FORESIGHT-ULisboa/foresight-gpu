@@ -26,7 +26,7 @@ The public interface is a **scikit-learn regressor**, so it drops into `Pipeline
 | Forward models | tiny `MLPModel`, hydrological `GR4JModel`, external `HYPEModel` (SMHI HYPE executable, driven by your own forcing DataFrames), or **bring your own** `BaseForwardModel` |
 | Error metrics | `nse`, `kge`, `kge_prime`, `mae`, `mse`, `rmse` — fast, vectorised over the population, + Lp regularisation |
 | Uncertainty | `ParetoEnsemble` post-convergence estimator (inverse-CDF, band aggregation) |
-| Model selection | cross-validation, `GridSearchCV`, and **early stopping** on held-out reliability |
+| Model selection | cross-validation, `GridSearchCV`, and **early stopping** on the held-out double-Pareto hypervolume |
 | Diagnostics | predictive QQ, time-series bands, double-Pareto front plots; Renard-2010 α/ξ/π |
 
 ## Installation
@@ -77,9 +77,23 @@ bands = gpu.predict_quantiles(X, quantiles=[0.05, 0.5, 0.95])   # probabilistic 
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score, GridSearchCV
 from foresight_gpu.scoring import reliability_scorer
 
-# stop when held-out reliability stops improving
-gpu = GPURegressor(early_stopping=True, n_iter=500, random_state=0).fit(X, y)
-print(gpu.n_iter_, gpu.best_iteration_)
+# Early stopping is inferred from the data — there is no early_stopping flag.
+# It monitors the held-out double-Pareto hypervolume: one number that rises both when
+# the front's loss drops and when it spreads further across the exceedance axis.
+
+# (a) let the estimator carve a chronological validation tail
+gpu = GPURegressor(validation_fraction=0.2, n_iter=500, random_state=0).fit(X, y)
+print(gpu.n_iter_, gpu.best_iteration_, gpu.early_stopping_)
+
+# (b) or split it yourself — any holdout you like, all of X_tr then trains
+gpu = GPURegressor(n_iter=500, random_state=0).fit(X_tr, y_tr, X_val=X_val, y_val=y_val)
+
+# (c) or neither: plain fit(X, y) runs the full n_iter
+
+# The same indicator is a normal scoring option, and takes the metric as a parameter,
+# so a fitted front can be re-read under any metric with no refit:
+gpu.ensemble_.score_hypervolume(X_test, y_test)           # calibration metric
+gpu.ensemble_.score_hypervolume(X_test, y_test, "kge")    # any other
 
 # time-series cross-validation on a probabilistic score
 scores = cross_val_score(GPURegressor(random_state=0), X, y,
@@ -119,7 +133,7 @@ foresight_gpu/     core package — a general sklearn regressor
     hype/          HYPEModel: the SMHI HYPE executable as a forward model,
                    driven by forcing you pass in (DataFrames or file paths)
   metrics/         fast vectorised metrics + Lp regularisation + Renard diagnostics
-  domination/      double-Pareto sorting (2 objectives; seam for >2)
+  domination/      double-Pareto sorting + hypervolume indicator (seam for >2 objectives)
   optimizers/      MOPSO
   scoring.py       probabilistic sklearn scorers
   crowding.py      NSGA-II crowding

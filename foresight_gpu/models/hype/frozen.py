@@ -37,9 +37,6 @@ class TableModel(BaseForwardModel):
     reporting.
     """
 
-    scales_inputs = False
-    scales_outputs = False
-
     def __init__(self, table=None, t0=0, date_column=0):
         self.table = table
         self.t0 = t0
@@ -117,8 +114,6 @@ def freeze(ensemble, dates=None):
         model=TableModel(table=table, t0=t0, date_column=0),
         params=np.arange(table.shape[1], dtype=float).reshape(-1, 1),
         exceedances=ensemble.exceedances,
-        x_scaler=ensemble.x_scaler,
-        y_scaler=ensemble.y_scaler,
         quantiles=ensemble.quantiles,
         band_width=ensemble.band_width,
         min_models=ensemble.min_models,

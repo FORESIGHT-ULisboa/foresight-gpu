@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "foresight-gpu"
-version = "0.2.0"
+version = "0.6.0"
 description = "Generalized Pareto Uncertainty (GPU): a scikit-learn-style probabilistic regressor"
 readme = "README.md"
 license = { file = "LICENSE" }

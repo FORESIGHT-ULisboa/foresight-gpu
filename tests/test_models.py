@@ -130,3 +130,77 @@ class TestOpenCLStub:
 def test_base_is_abstract():
     with pytest.raises(TypeError):
         BaseForwardModel()
+
+
+class TestMLPOutputRange:
+    """``output_scale`` / ``output_offset``: how a bounded-weight MLP reaches its target.
+
+    Weights are capped at +/-30 in model space, so the network's output tops out near
+    ``30 * (n_hidden + 1)`` whatever the data looks like. The affine map is a
+    reparameterisation of the linear output layer, which is why it is a plain hyperparameter
+    and not fitted state.
+    """
+
+    def test_defaults_are_the_identity(self, rng):
+        m = MLPModel(n_hidden=4)
+        assert (m.output_scale, m.output_offset) == (1.0, 0.0)
+        X = rng.uniform(-1, 1, size=(20, 3))
+        params = rng.normal(size=(5, m.n_parameters(3)))
+        plain = MLPModel(n_hidden=4).forward(X, params)
+        np.testing.assert_allclose(m.forward(X, params), plain)
+
+    def test_affine_map_is_applied_to_the_output(self, rng):
+        X = rng.uniform(-1, 1, size=(20, 2))
+        base = MLPModel(n_hidden=4)
+        params = rng.normal(size=(5, base.n_parameters(2)))
+        scaled = MLPModel(n_hidden=4, output_scale=7.0, output_offset=1000.0)
+        np.testing.assert_allclose(
+            scaled.forward(X, params), base.forward(X, params) * 7.0 + 1000.0
+        )
+
+    def test_reaches_a_target_the_bare_model_cannot(self, rng):
+        """The measured failure: without it the swarm never brackets a large-mean target."""
+        from foresight_gpu import GPURegressor
+
+        X = rng.uniform(-1, 1, size=(300, 2))
+        y = np.sin(2 * np.pi * X[:, 0]) + 0.25 * rng.standard_normal(300) + 1000.0
+
+        with pytest.warns(UserWarning, match="never brackets y"):
+            bare = GPURegressor(model=MLPModel(), population=150, n_iter=15,
+                                random_state=0).fit(X, y)
+        assert not np.isfinite(bare.predict(X)).any()
+
+        scaled = GPURegressor(
+            model=MLPModel(output_scale=y.std(), output_offset=y.mean()),
+            population=150, n_iter=15, random_state=0,
+        ).fit(X, y)
+        assert np.isfinite(scaled.predict(X)).all()
+        assert abs(np.mean(scaled.predict(X)) - y.mean()) < 5.0
+
+    def test_reaches_sklearn_param_machinery(self):
+        from sklearn.base import clone
+
+        assert "output_scale" in MLPModel().get_params()
+        assert clone(MLPModel(output_scale=3.0, output_offset=2.0)).output_scale == 3.0
+        m = MLPModel()
+        m.set_params(output_offset=9.0)
+        assert m.output_offset == 9.0
+
+
+def test_removed_scaling_flags_are_reported(rng):
+    """Models written against the pre-0.5.0 contract must not lose scaling silently."""
+    from foresight_gpu import GPURegressor
+
+    class Stale(MLPModel):
+        scales_inputs = True
+        scales_outputs = True
+
+    X = rng.uniform(-1, 1, size=(120, 2))
+    y = np.sin(2 * np.pi * X[:, 0])
+    with pytest.warns(UserWarning, match="no longer reads"):
+        GPURegressor(model=Stale(), population=40, n_iter=4, random_state=0).fit(X, y)
+
+
+def test_base_model_no_longer_declares_scaling_flags():
+    assert not hasattr(BaseForwardModel, "scales_inputs")
+    assert not hasattr(BaseForwardModel, "scales_outputs")

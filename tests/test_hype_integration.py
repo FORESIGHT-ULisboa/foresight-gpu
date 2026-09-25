@@ -169,9 +169,13 @@ class TestRunAccounting:
                 model.close()
 
         plain = run("plain")
-        monitored = run("monitored", early_stopping=True, check_every=1,
-                        scoring="reliability", n_iter_no_change=99)
-        assert monitored == plain
+        # Both monitors re-evaluate the whole population: the ensemble scorers via
+        # predict_quantiles, the hypervolume via a second forward pass. The cached window
+        # must absorb either.
+        assert run("reliability", validation_fraction=0.2, check_every=1,
+                   scoring="reliability", n_iter_no_change=99) == plain
+        assert run("hypervolume", validation_fraction=0.2, check_every=1,
+                   n_iter_no_change=99) == plain
 
     def test_cache_hits_are_counted(self, hype_model, hype_observations):
         X, y = hype_observations
