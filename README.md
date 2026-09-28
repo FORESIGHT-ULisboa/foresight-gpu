@@ -16,7 +16,7 @@ The public interface is a **scikit-learn regressor**, so it drops into `Pipeline
 > documented overload point.
 
 > **New here?** Start with [`notebooks/00_quickstart.ipynb`](notebooks/00_quickstart.ipynb),
-> then the seasonal-forecast, custom-model, diagnostics and HYPE notebooks.
+> then the other notebooks in order (see [Notebooks](#notebooks)).
 
 ## Features
 
@@ -75,6 +75,7 @@ bands = gpu.predict_quantiles(X, quantiles=[0.05, 0.5, 0.95])   # probabilistic 
 
 ```python
 from sklearn.model_selection import TimeSeriesSplit, cross_val_score, GridSearchCV
+from foresight_gpu.models import MLPModel
 from foresight_gpu.scoring import reliability_scorer
 
 # Early stopping is inferred from the data — there is no early_stopping flag.
@@ -100,7 +101,7 @@ scores = cross_val_score(GPURegressor(random_state=0), X, y,
                          cv=TimeSeriesSplit(5), scoring=reliability_scorer)
 
 # search nested model / regularisation hyper-parameters
-search = GridSearchCV(GPURegressor(random_state=0),
+search = GridSearchCV(GPURegressor(model=MLPModel(), random_state=0),
                       {"model__n_hidden": [4, 8], "reg_lambda": [0.0, 1e-3]},
                       cv=TimeSeriesSplit(3))
 ```
@@ -120,8 +121,18 @@ class MyModel(BaseForwardModel):
               # -> [n_samples, n_particles]  (vectorised over particles)
 ```
 
-See [`notebooks/02_custom_model.ipynb`](notebooks/02_custom_model.ipynb) and the contract in
+See [`notebooks/01_custom_model.ipynb`](notebooks/01_custom_model.ipynb) and the contract in
 [AGENTS.md](AGENTS.md).
+
+## Notebooks
+
+| notebook | what it shows |
+|---|---|
+| [`00_quickstart`](notebooks/00_quickstart.ipynb) | fit, predict and plot bands on a synthetic daily record |
+| [`01_custom_model`](notebooks/01_custom_model.ipynb) | plug your own `BaseForwardModel` into GPU |
+| [`02_gr4j`](notebooks/02_gr4j.ipynb) | a hydrological forward model (GR4J) on a synthetic catchment |
+| [`03_extra_diagnostics`](notebooks/03_extra_diagnostics.ipynb) | hypervolume, early stopping, cross-validation, grid search, pipelines |
+| [`04_uncertainty_experiments`](notebooks/04_uncertainty_experiments.ipynb) | nine synthetic tests with known error structure (T1–T9) |
 
 ## Project structure
 
@@ -129,7 +140,7 @@ See [`notebooks/02_custom_model.ipynb`](notebooks/02_custom_model.ipynb) and the
 foresight_gpu/     core package — a general sklearn regressor
   estimator.py     GPURegressor
   ensemble.py      ParetoEnsemble (fitted artifact)
-  models/          BaseForwardModel, MLPModel, GR4JModel
+  models/          BaseForwardModel, MLPModel, GR4JModel, MLPModelOpenCL (stub)
     hype/          HYPEModel: the SMHI HYPE executable as a forward model,
                    driven by forcing you pass in (DataFrames or file paths)
   metrics/         fast vectorised metrics + Lp regularisation + Renard diagnostics
@@ -138,7 +149,6 @@ foresight_gpu/     core package — a general sklearn regressor
   scoring.py       probabilistic sklearn scorers
   crowding.py      NSGA-II crowding
   utils/           helpers: features, screening, plotting
-examples/          repo-only data + scripts (not shipped)
 notebooks/         numbered, self-contained walkthroughs
 tests/             pytest suite
 ```

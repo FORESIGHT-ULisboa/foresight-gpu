@@ -1,8 +1,5 @@
 """Double-Pareto sorting: invariants + equivalence with the reference algorithm."""
 
-import importlib.util
-from pathlib import Path
-
 import numpy as np
 import pytest
 
@@ -47,22 +44,6 @@ class TestEquivalence:
         for n in (5, 50, 200, 1000):
             obj = _objectives(rng, n)
             assert sorter.sort(obj) == _reference_fronts(obj[:, 0], obj[:, 1])
-
-    def test_matches_legacy_if_present(self, rng):
-        legacy = Path(__file__).resolve().parent.parent / "_legacy" / "domination.py"
-        if not legacy.exists():
-            pytest.skip("legacy source removed")
-        spec = importlib.util.spec_from_file_location("_legacy_domination", legacy)
-        mod = importlib.util.module_from_spec(spec)
-        try:
-            spec.loader.exec_module(mod)
-        except Exception as exc:  # legacy code predates NumPy 2.0
-            pytest.skip(f"legacy domination not runnable under this NumPy: {exc}")
-        sorter = DoubleParetoSorter()
-        for n in (10, 100, 500):
-            obj = _objectives(rng, n)
-            expected = mod.convexSorting(obj[:, 0].copy(), obj[:, 1].copy())
-            assert sorter.sort(obj) == [list(f) for f in expected]
 
 
 class TestStructure:

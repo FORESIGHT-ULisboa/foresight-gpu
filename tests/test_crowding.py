@@ -1,10 +1,6 @@
 """NSGA-II crowding-distance tests."""
 
-import importlib.util
-from pathlib import Path
-
 import numpy as np
-import pytest
 
 from foresight_gpu.crowding import phenotype_crowding
 
@@ -42,19 +38,3 @@ class TestCrowding:
         both = phenotype_crowding(o0, o1, fronts=fronts)
         interior = np.isfinite(d0) & np.isfinite(both)
         assert np.all(both[interior] >= d0[interior] - 1e-12)
-
-    def test_matches_legacy_if_present(self, rng):
-        legacy = Path(__file__).resolve().parent.parent / "_legacy" / "crowding.py"
-        if not legacy.exists():
-            pytest.skip("legacy source removed")
-        spec = importlib.util.spec_from_file_location("_legacy_crowding", legacy)
-        mod = importlib.util.module_from_spec(spec)
-        try:
-            spec.loader.exec_module(mod)
-            o0, o1 = rng.uniform(size=50), rng.uniform(size=50)
-            fronts = rng.integers(0, 4, size=50)
-            ref = mod.phenCrowdingNSGAII(o0, o1, fronts=fronts)
-        except Exception as exc:  # legacy code predates NumPy 2.0 (e.g. np.Inf)
-            pytest.skip(f"legacy crowding not runnable under this NumPy: {exc}")
-        mine = phenotype_crowding(o0, o1, fronts=fronts)
-        np.testing.assert_allclose(mine, ref, equal_nan=True)

@@ -18,8 +18,17 @@ def _get_ax(ax):
     return ax
 
 
-def plot_timeseries(bands, quantiles, observed=None, index=None, ax=None, color="C0"):
-    """Plot nested prediction bands (and observations) over time.
+def _pct(q):
+    return f"{100 * q:.1f}".rstrip("0").rstrip(".")
+
+
+def plot_timeseries(bands, quantiles, observed=None, index=None, ax=None, color="k",
+                    observed_color="C3"):
+    """Plot non-exceedance-probability bands (and observations) over time.
+
+    Each interval between consecutive quantiles is filled and labelled (e.g. ``"5-25%"``),
+    shaded from ``color`` at the median to near-white in the tails. The legend sits in a row
+    above the axis.
 
     Parameters
     ----------
@@ -33,24 +42,51 @@ def plot_timeseries(bands, quantiles, observed=None, index=None, ax=None, color=
         X coordinates (defaults to a range).
     ax : matplotlib axis, optional
     color : str
-        Band colour.
+        Colour of the central band; outer bands fade towards white.
+    observed_color : str
+        Colour of the observed line.
     """
+    from matplotlib.colors import to_rgb
+    from matplotlib.patches import Rectangle
+
     ax = _get_ax(ax)
     bands = np.asarray(bands, dtype=float)
     quantiles = np.asarray(quantiles, dtype=float)
     n, nq = bands.shape
     x = np.arange(n) if index is None else np.asarray(index)
+    base = np.asarray(to_rgb(color))
 
-    for i in range(nq // 2):
-        ax.fill_between(x, bands[:, i], bands[:, nq - 1 - i], color=color,
-                        alpha=0.15, linewidth=0.0)
-    mid = int(np.argmin(np.abs(quantiles - 0.5)))
-    ax.plot(x, bands[:, mid], color=color, lw=1.0, label="median")
+    # shade by rank away from the median: full colour (0.6 if a median line is drawn over
+    # it) for the central interval, 0.25 for the outer tails
+    has_median = bool(np.any(np.isclose(quantiles, 0.5)))
+    top = 0.6 if has_median else 1.0
+    centre = (quantiles[:-1] + quantiles[1:]) / 2.0
+    rank = np.unique(np.round(np.abs(centre - 0.5), 9), return_inverse=True)[1]
+    steps = max(rank.max(), 1)
+    for i in range(nq - 1):
+        shade = 1.0 - (1.0 - base) * (top - (top - 0.25) * rank[i] / steps)
+        # thin same-colour edge hides antialiasing seams between adjacent fills
+        ax.fill_between(x, bands[:, i], bands[:, i + 1], color=shade, edgecolor=shade,
+                        linewidth=0.3, label=f"{_pct(quantiles[i])}-{_pct(quantiles[i + 1])}%")
+    if has_median:
+        mid = int(np.argmin(np.abs(quantiles - 0.5)))
+        ax.plot(x, bands[:, mid], color=color, lw=1.0, label="median")
     if observed is not None:
-        ax.plot(x, np.asarray(observed), color="k", lw=0.8, alpha=0.8, label="observed")
+        ax.plot(x, np.asarray(observed), color=observed_color, lw=0.9, alpha=0.9,
+                label="observed")
     ax.set_xlabel("time")
     ax.set_ylabel("value")
-    ax.legend(frameon=False, fontsize=9)
+    # legend in rows of <= 8 above the axis; a title set afterwards needs pad= to clear it
+    handles, labels = ax.get_legend_handles_labels()
+    nrow = -(-len(handles) // 8)
+    ncol = -(-len(handles) // nrow)
+    blank = nrow * ncol - len(handles)
+    handles += [Rectangle((0, 0), 0, 0, visible=False)] * blank
+    labels += [""] * blank
+    order = [r * ncol + c for c in range(ncol) for r in range(nrow)]  # mpl fills by column
+    ax.legend([handles[i] for i in order], [labels[i] for i in order], loc="lower left",
+              bbox_to_anchor=(0.0, 1.01, 1.0, 0.1), mode="expand", ncol=ncol,
+              frameon=False, fontsize=8, handlelength=1.5)
     return ax
 
 

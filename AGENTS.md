@@ -40,7 +40,7 @@ estimator.
 
 ```
 GPURegressor (estimator)                 foresight_gpu/estimator.py
-  ├─ model: BaseForwardModel             foresight_gpu/models/      (MLPModel, GR4JModel, byo)
+  ├─ model: BaseForwardModel             foresight_gpu/models/      (MLPModel, GR4JModel, HYPEModel, byo)
   ├─ optimizer: BaseOptimizer            foresight_gpu/optimizers/  (MOPSO)
   ├─ metric: Metric (training loss)      foresight_gpu/metrics/
   ├─ DominanceSorter + hypervolume       foresight_gpu/domination/  (ranking & indicators)
@@ -130,7 +130,7 @@ the price of a unit of uncovered exceedance**. Reported as `hv = 1 − D/P ∈ [
 better, to match the `scoring` contract.
 
 - **The computation lives on `ParetoEnsemble`, not the estimator.** `score_hypervolume(X, y,
-  metric=None, *, penalty, interpolation, details)` and
+  metric=None, *, penalty, interpolation, space, details)` and
   `front_objectives(X, y, metric=None) -> (eta, loss, front)` are the public surface. The
   ensemble already carries the whole population and the model, so the only
   thing it was ever missing was the metric — and that is a **parameter**, with the
@@ -148,7 +148,7 @@ better, to match the `scoring` contract.
     is what makes the number readable.
   - **Why offer it.** Linear space spends almost the whole box on losses nobody cares about:
     at `P=100` the region of interest (losses of order 1) is a hundredth of the axis. Measured
-    on the synthetic problem in `02_diagnostics`, the usable `hv` range is **2–7× wider** in
+    on a synthetic sine-plus-noise problem, the usable `hv` range is **2–7× wider** in
     log10 (2.3× over one run's early-stopping trace, 6.9× over converged fronts at 5…160
     generations). The factor depends on which fronts are compared; the direction does not.
   - **This is not the sorter's `log10`.** That one is floored at `tiny`, unbounded below and
@@ -185,7 +185,7 @@ better, to match the `scoring` contract.
   (0.25). Measured at the NSE climatology ceiling `P=1`: **~0.8–0.9 of front-0 clipped**, `hv`
   ~0.01 against ~0.98 at `P=100` — the same worse-than-climatology figure that motivated the
   constant default, now reported instead of inferred. The clean demonstration is a
-  low-variance validation window (`02_diagnostics`): it inflates every loss at once while
+  low-variance validation window: it inflates every loss at once while
   `coverage` stays at 1.00, so `clipped_fraction` is the only thing that moves. A plain bias
   moves `coverage` instead — the front keeps some high-η particle that tracks the shift.
 - **`P` defaults to the constant `DEFAULT_HV_PENALTY = 100.0`, deliberately not a
@@ -219,8 +219,8 @@ better, to match the `scoring` contract.
 - **Drawing it: `utils/plotting.py::plot_hypervolume(eta, loss, penalty, ...)`.** Takes the
   `(eta, loss, front)` tuple `front_objectives` returns and covers all four cases
   (`space` x `interpolation`). It **recomputes `hv` from the same call it draws from** and puts
-  it in the title, so the picture and the number cannot drift apart — which they had, in
-  notebook 02: the figure reported `interpolation="linear"` while shading the step staircase.
+  it in the title, so the picture and the number cannot drift apart — which they had in an
+  earlier notebook: the figure reported `interpolation="linear"` while shading the step staircase.
   `test_plot_hypervolume_title_matches_the_indicator` is the lock; keep it green.
   - `space="log10"` draws raw loss on a log axis. That is not cosmetic: a straight polyline
     between two points on a log axis has the geometric mean as its per-cell average, which is
@@ -305,7 +305,7 @@ better, to match the `scoring` contract.
   `predict`). The same callables back the early-stopping monitor. **All four go through
   `score_ensemble`**; `"hypervolume"` branches *before* `predict_quantiles`, since it needs
   neither the bands nor the p-values, which makes it the cheapest of the four. The ensemble
-  carries `metric`, the resolved `hv_penalty` and `hv_interpolation`, so a scorer reaching it
+  carries `metric`, the resolved `hv_penalty`, `hv_interpolation` and `hv_space`, so a scorer reaching it
   through `GridSearchCV` honours the configuration instead of silently defaulting.
   `GPURegressor.score_hypervolume` is a thin delegate to `ensemble_` — which means it scores
   the front kept after a rollback, i.e. the one `predict` uses, not the final generation.
@@ -459,8 +459,7 @@ leak into the engine.
 ## Tests
 
 - `pytest`, tests in `tests/`, config in `pyproject.toml`. Synthetic fixtures (seeded
-  `np.random.default_rng`) for analytic-exact assertions; the example series under
-  `examples/data/` back optional integration tests (skip if absent).
+  `np.random.default_rng`) for analytic-exact assertions.
 - Metrics validated against `forecast_performance`. Plotting tests run **headless**
   (`matplotlib.use("Agg")`), inspecting `fig`/axes/artists rather than rendering.
 - Keep the sklearn estimator checks, the "three calling styles agree" metric tests, the CV
@@ -477,6 +476,5 @@ leak into the engine.
 
 ## Important Notes
 
-- The legacy code that this project was based on was validated for a long time and is considered reliable. Being so when you are using it you should not assume that any errors should be solved with wrapping the legacy code with a lot of fall backs.
-
-- The same is applicable to the new code, you should not invent if you are unsure of how to do things, and you instead ask for help.
+- Do not invent: if you are unsure how to do something, ask for help instead of wrapping
+  the code in fallbacks.
