@@ -12,6 +12,7 @@ so ``n_parameters = (n_features + 2) * n_hidden + 1``.
 
 import numpy as np
 
+from ..metrics.regularization import lp_penalty
 from .base import BaseForwardModel
 
 _ACTIVATIONS = {"tanh", "tan", "logistic", "log", "sigmoid", "linear", "lin",
@@ -48,15 +49,20 @@ class MLPModel(BaseForwardModel):
             MLPModel(output_scale=y.std(), output_offset=y.mean())
 
         Inputs are **not** scaled here; use a ``Pipeline`` for those.
+    reg_lambda, reg_p : float, int, optional
+        L-p regularisation coefficient and norm order (WRR Eq. 2) on the connection
+        weights (biases are not penalised). ``reg_lambda=0`` disables it.
     """
 
     def __init__(self, n_hidden=8, activation="tanh", leaky_slope=0.01,
-                 output_scale=1.0, output_offset=0.0):
+                 output_scale=1.0, output_offset=0.0, reg_lambda=0.0, reg_p=1):
         self.n_hidden = n_hidden
         self.activation = activation
         self.leaky_slope = leaky_slope
         self.output_scale = output_scale
         self.output_offset = output_offset
+        self.reg_lambda = reg_lambda
+        self.reg_p = reg_p
 
     def n_parameters(self, n_features):
         return (n_features + 2) * self.n_hidden + 1
@@ -65,8 +71,13 @@ class MLPModel(BaseForwardModel):
         k = self.n_parameters(n_features)
         return np.full(k, -30.0), np.full(k, 30.0)
 
-    def regularizable_mask(self, n_features):
-        # Regularise connection weights (input->hidden and hidden->output), not biases.
+    def regularization(self, params, n_features):
+        if not self.reg_lambda:
+            return 0.0
+        return lp_penalty(params, self._weight_mask(n_features), self.reg_lambda, self.reg_p)
+
+    def _weight_mask(self, n_features):
+        # Connection weights (input->hidden and hidden->output), not biases.
         h = self.n_hidden
         mask = np.zeros(self.n_parameters(n_features), dtype=bool)
         mask[: n_features * h] = True   # input -> hidden

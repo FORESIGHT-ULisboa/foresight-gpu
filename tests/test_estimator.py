@@ -154,7 +154,7 @@ class TestWarmStart:
 
 class TestRegularization:
     def test_regularized_fit_runs(self, data):
-        gpu, X, y = _fit(data, reg_lambda=1e-3, reg_p=1)
+        gpu, X, y = _fit(data, model=MLPModel(reg_lambda=1e-3, reg_p=1))
         assert np.all(np.isfinite(gpu.predict(X)))
 
 

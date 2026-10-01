@@ -9,6 +9,7 @@ from foresight_gpu import GPURegressor
 from foresight_gpu import double_pareto_hypervolume
 from foresight_gpu.utils import (
     plot_double_pareto_front,
+    plot_history,
     plot_hypervolume,
     plot_qq,
     plot_timeseries,
@@ -98,19 +99,28 @@ def test_plot_hypervolume_log_space(front):
     plt.close("all")
 
 
-@pytest.mark.parametrize("space,penalty", [("linear", 10.0), ("log10", 2.0)])
+@pytest.mark.parametrize("space,reference", [("linear", 10.0), ("log10", 2.0)])
 @pytest.mark.parametrize("interpolation", ["step", "linear"])
-def test_plot_hypervolume_title_matches_the_indicator(front, space, penalty,
+def test_plot_hypervolume_title_matches_the_indicator(front, space, reference,
                                                       interpolation):
     """The figure and its number come from one call, and must stay that way."""
     eta, loss, idx = front
-    ax = plot_hypervolume(eta, loss, penalty, front=idx, space=space,
+    ax = plot_hypervolume(eta, loss, reference, front=idx, space=space,
                           interpolation=interpolation)
     expected = double_pareto_hypervolume(
-        np.column_stack([eta, loss]), penalty, space=space,
+        np.column_stack([eta, loss]), reference, space=space,
         interpolation=interpolation, front=idx,
     )
     assert float(ax.get_title().split("hv = ")[1]) == pytest.approx(expected, abs=5e-5)
+    plt.close("all")
+
+
+def test_plot_hypervolume_step_reaches_the_minimum_between_midpoints():
+    eta, loss = np.array([0.1, 0.4, 0.9]), np.array([0.8, 0.2, 0.5])
+    ax = plot_hypervolume(eta, loss, 1.0, front=[0, 1, 2])
+    xs, ys = ax.get_lines()[0].get_xydata().T
+    # minimum loss held from midpoint 0.25 to midpoint 0.65
+    np.testing.assert_allclose(xs[ys == 0.2], [0.25, 0.4, 0.4, 0.65])
     plt.close("all")
 
 
@@ -131,4 +141,27 @@ def test_shared_axes_compose(fitted, front):
                     observed=y[:100], ax=axes[2])
     plot_hypervolume(eta, loss, 10.0, front=idx, ax=axes[3])
     assert all(isinstance(a, Axes) for a in axes)
+    plt.close("all")
+
+
+def test_plot_history_draws_each_panel_from_its_record():
+    rng = np.random.default_rng(0)
+    X = rng.uniform(-1, 1, size=(250, 2))
+    y = np.sin(2 * np.pi * X[:, 0]) + 0.3 * rng.standard_normal(250)
+    gpu = GPURegressor(population=60, n_iter=12, check_every=2, diagnostics_every=4,
+                       n_iter_no_change=99, validation_fraction=0.2,
+                       random_state=0).fit(X, y)
+    axes = plot_history(gpu.history_, gpu.diagnostics_, gpu.best_iteration_)
+    assert len(axes) == 4
+    hv_train = axes[0].get_lines()[0]
+    np.testing.assert_array_equal(hv_train.get_xdata(),
+                                  [h["iteration"] for h in gpu.history_])
+    np.testing.assert_allclose(hv_train.get_ydata(), [h["train_hv"] for h in gpu.history_])
+    alpha_val = [ln for ln in axes[1].get_lines() if ln.get_label() == "val"][0]
+    np.testing.assert_allclose(alpha_val.get_ydata(),
+                               [d["val_reliability"] for d in gpu.diagnostics_])
+    plt.close("all")
+
+    # no diagnostics rows -> the hypervolume panel alone
+    assert len(plot_history(gpu.history_)) == 1
     plt.close("all")

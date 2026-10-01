@@ -7,6 +7,7 @@ scikit-learn regressor.
 from .features import LagFeatures, OudinPET, PeriodicFeatures, RollingSum
 from .plotting import (
     plot_double_pareto_front,
+    plot_history,
     plot_hypervolume,
     plot_qq,
     plot_timeseries,
@@ -22,6 +23,7 @@ __all__ = [
     "plot_qq",
     "plot_double_pareto_front",
     "plot_hypervolume",
+    "plot_history",
     "prepare_arrays",
     "screen_initial_population",
 ]

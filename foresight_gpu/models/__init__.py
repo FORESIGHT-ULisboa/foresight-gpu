@@ -6,8 +6,7 @@ a documented base class, :class:`BaseForwardModel`, for bringing your own.
 
 from .base import BaseForwardModel
 from .gr4j import GR4JModel
-from .hype import HYPEModel
 from .mlp import MLPModel
 from .mlp_opencl import MLPModelOpenCL
 
-__all__ = ["BaseForwardModel", "MLPModel", "GR4JModel", "HYPEModel", "MLPModelOpenCL"]
+__all__ = ["BaseForwardModel", "MLPModel", "GR4JModel", "MLPModelOpenCL"]

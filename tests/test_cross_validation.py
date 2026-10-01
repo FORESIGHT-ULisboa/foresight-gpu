@@ -42,13 +42,13 @@ def test_gridsearch_nested_params(data):
     X, y = data
     search = GridSearchCV(
         GPURegressor(model=MLPModel(), population=70, n_iter=12, random_state=0),
-        param_grid={"model__n_hidden": [4, 8], "reg_lambda": [0.0, 1e-3]},
+        param_grid={"model__n_hidden": [4, 8], "model__reg_lambda": [0.0, 1e-3]},
         cv=TimeSeriesSplit(3),
         scoring=make_gpu_scorer("reliability"),
     )
     search.fit(X, y)
     assert "model__n_hidden" in search.best_params_
-    assert "reg_lambda" in search.best_params_
+    assert "model__reg_lambda" in search.best_params_
     assert np.all(np.isfinite(search.predict(X)))
 
 

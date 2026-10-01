@@ -130,11 +130,11 @@ class TestFrontHypervolume:
         ens = gpu.ensemble_
         eta, loss, front = ens.front_objectives(X, y)
         objectives = np.column_stack([eta, loss])
-        direct = double_pareto_hypervolume(objectives, ens.hv_penalty, front=front)
+        direct = double_pareto_hypervolume(objectives, ens.hv_reference, front=front)
         assert direct == pytest.approx(ens.score_hypervolume(X, y))
         # the precomputed front is the one the indicator would have found itself
         assert double_pareto_hypervolume(
-            objectives, ens.hv_penalty
+            objectives, ens.hv_reference
         ) == pytest.approx(direct)
 
     def test_front_objectives_drops_nan_y(self, fitted_ensemble):
@@ -157,14 +157,14 @@ class TestFrontHypervolume:
 
         ens = ParetoEnsemble(
             _ConstModel(), np.array([[0.0], [1e6]]), np.array([0.05, 0.95]),
-            metric="mae", hv_penalty=100.0,
+            metric="mae", hv_reference=100.0,
         )
         big = np.arange(50, dtype=float) * 1000.0
         with pytest.warns(UserWarning, match="pinned at 0"):
             assert ens.score_hypervolume(np.zeros((50, 1)), big) == pytest.approx(0.0)
         with _w.catch_warnings():
             _w.simplefilter("error")
-            assert ens.score_hypervolume(np.zeros((50, 1)), big, penalty=1e7) > 0.0
+            assert ens.score_hypervolume(np.zeros((50, 1)), big, reference=1e7) > 0.0
 
     def test_warns_when_the_ceiling_clips_much_of_the_front(self, fitted_ensemble):
         """The diagnostic rung: a too-tight P is otherwise invisible.
@@ -177,7 +177,7 @@ class TestFrontHypervolume:
 
         gpu, X, y = fitted_ensemble
         with pytest.warns(UserWarning, match="clips .* of front-0"):
-            parts = gpu.ensemble_.score_hypervolume(X, y, penalty=1.0, details=True)
+            parts = gpu.ensemble_.score_hypervolume(X, y, reference=1.0, details=True)
         assert parts["clipped_fraction"] > HV_CLIP_WARN_FRACTION
 
         with _w.catch_warnings():  # the generous default clips nothing here
@@ -193,18 +193,18 @@ class TestFrontHypervolume:
         assert parts["space"] == "linear"
 
     def test_log10_space_round_trips_through_the_ensemble(self, fitted_ensemble):
-        """hv_space is carried like metric and hv_penalty, and is overridable per call."""
+        """hv_space is carried like metric and hv_reference, and is overridable per call."""
         gpu, X, y = fitted_ensemble
         ens = gpu.ensemble_
         assert ens.hv_space == "linear"
 
-        direct = ens.score_hypervolume(X, y, penalty=2.0, space="log10", details=True)
+        direct = ens.score_hypervolume(X, y, reference=2.0, space="log10", details=True)
         assert direct["space"] == "log10"
         assert 0.0 <= direct["hv"] <= 1.0
 
         # a copy: the fixture is module-scoped, so never mutate it in place
         carried = pickle.loads(pickle.dumps(ens))
-        carried.hv_space, carried.hv_penalty = "log10", 2.0
+        carried.hv_space, carried.hv_reference = "log10", 2.0
         assert carried.score_hypervolume(X, y) == pytest.approx(direct["hv"])
         assert score_ensemble(carried, X, y, "hypervolume") == pytest.approx(direct["hv"])
 
@@ -215,6 +215,33 @@ class TestFrontHypervolume:
         del ens.hv_space
         assert ens.score_hypervolume(X, y) == pytest.approx(
             gpu.ensemble_.score_hypervolume(X, y)
+        )
+
+    def test_old_pickles_keep_their_hv_penalty(self, fitted_ensemble):
+        """Pre-0.7.0 ensembles stored the reference as ``hv_penalty``."""
+        gpu, X, y = fitted_ensemble
+        ens = pickle.loads(pickle.dumps(gpu.ensemble_))
+        del ens.hv_reference
+        ens.hv_penalty = 7.0
+        assert ens.score_hypervolume(X, y) == pytest.approx(
+            gpu.ensemble_.score_hypervolume(X, y, reference=7.0)
+        )
+
+    def test_stored_reference_is_only_for_the_calibration_reading(self, fitted_ensemble):
+        """R carries the calibration metric's units; another metric or space falls back
+        to the fixed default for that space."""
+        from foresight_gpu import DEFAULT_HV_LOG_REFERENCE, DEFAULT_HV_REFERENCE
+
+        gpu, X, y = fitted_ensemble
+        ens = gpu.ensemble_
+        assert ens.score_hypervolume(X, y, "kge", details=True)["reference"] == (
+            DEFAULT_HV_REFERENCE
+        )
+        assert ens.score_hypervolume(X, y, space="log10", details=True)["reference"] == (
+            DEFAULT_HV_LOG_REFERENCE
+        )
+        assert ens.score_hypervolume(X, y, "nse", details=True)["reference"] == (
+            ens.hv_reference
         )
 
     def test_metric_survives_pickling(self, fitted_ensemble):

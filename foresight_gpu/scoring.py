@@ -1,11 +1,9 @@
-"""Probabilistic scorers for model selection and early stopping.
+"""Probabilistic scorers for model selection (``cross_val_score`` / ``GridSearchCV``).
 
 Unlike ``sklearn.metrics.make_scorer`` (which only sees ``predict``), these reach the
 **probabilistic** output via the fitted :class:`~foresight_gpu.ensemble.ParetoEnsemble`.
 They follow the sklearn scorer contract ``scorer(estimator, X, y) -> float`` with **higher =
-better**, so they drop straight into ``cross_val_score(..., scoring=...)`` and
-``GridSearchCV``. The same logic backs the estimator's internal early-stopping monitor via
-:func:`score_ensemble`.
+better**. Early stopping does not use them: it always monitors the validation hypervolume.
 
 All four go through :func:`score_ensemble`. ``"hypervolume"`` reads the fitted **front**
 (:meth:`ParetoEnsemble.score_hypervolume`) rather than the aggregated bands, which is why
@@ -13,8 +11,25 @@ it branches before ``predict_quantiles`` is ever called.
 """
 
 import numpy as np
+from forecast_performance.metrics.probabilistic import crps as fp_crps
 
-from .metrics.probabilistic import predictive_pvalues, reliability, renard_metrics
+from .metrics.probabilistic import predictive_pvalues, renard_metrics
+
+
+def probabilistic_diagnostics(ensemble, agg, y):
+    """Reliability alpha, resolution pi and mean CRPS of a band matrix.
+
+    ``agg`` is ``ensemble``'s post-processed band matrix on the rows of ``y`` (from
+    ``predict_quantiles``, or ``_bands_from_sims`` when the simulations are already in hand).
+    """
+    y = np.asarray(y, dtype=float).ravel()
+    pvalues = predictive_pvalues(agg, y, ensemble.quantiles)
+    renard = renard_metrics(pvalues, agg, ensemble.band_probabilities)
+    return {
+        "reliability": renard["alpha"],
+        "resolution": renard["pi"],
+        "crps": _crps(ensemble, agg, y),
+    }
 
 
 def score_ensemble(ensemble, X, y, scoring="crps"):
@@ -24,7 +39,7 @@ def score_ensemble(ensemble, X, y, scoring="crps"):
     ``[0, 1]``), ``"reliability"`` (Renard alpha), ``"resolution"`` (pi), ``"crps"``
     (negated, via ``forecast_performance``) or a callable ``scoring(ensemble, X, y) -> float``.
 
-    ``"hypervolume"`` uses the metric, ceiling, interpolation and objective space the
+    ``"hypervolume"`` uses the metric, reference, interpolation and objective space the
     ensemble was built with; call :meth:`ParetoEnsemble.score_hypervolume` directly to
     override any of them.
     """
@@ -35,32 +50,21 @@ def score_ensemble(ensemble, X, y, scoring="crps"):
     # bands nor the p-values, so branching here keeps it the cheapest of the four.
     if scoring == "hypervolume":
         return float(ensemble.score_hypervolume(X, y))
+    if scoring not in ("reliability", "resolution", "crps"):
+        raise ValueError(
+            f"Unknown scoring {scoring!r}; use 'hypervolume', 'reliability', "
+            f"'resolution', 'crps' or a callable."
+        )
 
-    y = np.asarray(y, dtype=float).ravel()
-    agg = ensemble.predict_quantiles(X)
-    pvalues = predictive_pvalues(agg, y, ensemble.quantiles)
-
-    if scoring == "reliability":
-        return float(reliability(pvalues))
-    if scoring == "resolution":
-        return float(renard_metrics(pvalues, agg, ensemble.band_probabilities)["pi"])
-    if scoring == "crps":
-        return -float(_crps(ensemble, agg, y))
-    raise ValueError(
-        f"Unknown scoring {scoring!r}; use 'hypervolume', 'reliability', 'resolution', "
-        f"'crps' or a callable."
-    )
+    diag = probabilistic_diagnostics(ensemble, ensemble.predict_quantiles(X), y)
+    return -diag["crps"] if scoring == "crps" else float(diag[scoring])
 
 
 def _crps(ensemble, agg, y):
-    """Mean CRPS via the companion ``forecast_performance`` package."""
-    try:
-        from performance.metrics.probabilistic import crps as fp_crps
-    except Exception as exc:  # pragma: no cover - optional path
-        raise ImportError(
-            "scoring='crps' requires forecast_performance (imports as `performance`)."
-        ) from exc
+    """Mean CRPS over the rows with a complete band set."""
     mask = np.isfinite(agg).all(axis=1)
+    if not mask.any():
+        return float("nan")
     value = fp_crps(agg[mask], np.asarray(ensemble.quantiles, dtype=float),
                     y[mask], "probabilistic")
     return float(np.nanmean(value))

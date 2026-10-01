@@ -5,21 +5,23 @@ into a reliable predictive distribution via a double / mirrored Pareto front ove
 non-exceedance and an error metric.
 """
 
-__version__ = "0.6.0"
+__version__ = "0.8.0"
 
 from .estimator import GPURegressor
 from .ensemble import DEFAULT_QUANTILES, ParetoEnsemble
-from .models import BaseForwardModel, GR4JModel, HYPEModel, MLPModel, MLPModelOpenCL
+from .models import BaseForwardModel, GR4JModel, MLPModel, MLPModelOpenCL
 from .optimizers import MOPSO, BaseOptimizer
 from .domination import (
-    DEFAULT_HV_LOG_PENALTY,
-    DEFAULT_HV_PENALTY,
+    DEFAULT_HV_LOG_REFERENCE,
+    DEFAULT_HV_REFERENCE,
     HV_CLIP_WARN_FRACTION,
+    HV_REFERENCE_MARGIN,
     DominanceSorter,
     DoubleParetoSorter,
-    default_hv_penalty,
+    default_hv_reference,
     double_pareto_hypervolume,
     hypervolume,
+    reference_nadir,
 )
 from .metrics import (
     get_metric,
@@ -40,7 +42,6 @@ __all__ = [
     "BaseForwardModel",
     "MLPModel",
     "GR4JModel",
-    "HYPEModel",
     "MLPModelOpenCL",
     "MOPSO",
     "BaseOptimizer",
@@ -48,10 +49,12 @@ __all__ = [
     "DoubleParetoSorter",
     "hypervolume",
     "double_pareto_hypervolume",
-    "default_hv_penalty",
-    "DEFAULT_HV_PENALTY",
-    "DEFAULT_HV_LOG_PENALTY",
+    "default_hv_reference",
+    "reference_nadir",
+    "DEFAULT_HV_REFERENCE",
+    "DEFAULT_HV_LOG_REFERENCE",
     "HV_CLIP_WARN_FRACTION",
+    "HV_REFERENCE_MARGIN",
     "get_metric",
     "nse",
     "kge",

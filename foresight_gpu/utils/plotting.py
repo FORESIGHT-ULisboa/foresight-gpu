@@ -1,13 +1,15 @@
 """Plotting helpers for GPU diagnostics (matplotlib).
 
-Four views: probabilistic time-series bands, the predictive QQ plot, the double-Pareto front,
-and the hypervolume decomposition. Each accepts an optional ``ax`` and returns it, so they
-compose into subplots and are testable headlessly (``matplotlib.use("Agg")``).
+Five views: probabilistic time-series bands, the predictive QQ plot, the double-Pareto front,
+the hypervolume decomposition, and the fit history. Each accepts an optional ``ax`` (or
+``axes``) and returns it, so they compose into subplots and are testable headlessly
+(``matplotlib.use("Agg")``).
 """
 
 import numpy as np
 
 from ..domination import DoubleParetoSorter, double_pareto_hypervolume
+from ..domination.hypervolume import _step_cells
 
 
 def _get_ax(ax):
@@ -153,34 +155,29 @@ def plot_double_pareto_front(exceedance, loss, fronts=None, kept=None, rejected=
     return ax
 
 
-#: Front sizes above which the anchor connector is drawn without its label.
-_ANCHOR_LABEL_MAX_FRONT = 20
-
-
-def _hv_bounds(penalty, space):
+def _hv_bounds(reference, space):
     """Floor and ceiling in **raw loss** units for the given integration space."""
     if space == "log10":
-        return 10.0 ** -penalty, 10.0 ** penalty
-    return 0.0, penalty
+        return 10.0 ** -reference, 10.0 ** reference
+    return 0.0, reference
 
 
-def _hv_boundary(e, l, interpolation):
+def _hv_boundary(e, l, finite, interpolation):
     """The attainment boundary actually integrated, as ``(x, y)`` polyline coordinates.
 
-    ``step`` takes ``max(l_i, l_i+1)`` per cell -- the standard hypervolume staircase, which
-    on a V-shaped front is always the *outer* endpoint. ``linear`` is the polyline through the
-    points; on a log-scaled axis that is the geometric mean per cell, which is exactly what
-    ``space="log10"`` integrates, so one construction serves both spaces.
+    ``step`` draws the indicator's own cells (``_step_cells``); ``max`` and the minimum are
+    monotone, so the raw-loss cells are the log-space ones too. ``linear`` is the polyline
+    through the points; on a log-scaled axis that is the geometric mean per cell, which is
+    exactly what ``space="log10"`` integrates, so one construction serves both spaces.
     """
     if interpolation == "step":
-        heights = np.maximum(l[:-1], l[1:])
-        return np.repeat(e, 2)[1:-1], np.repeat(heights, 2)
+        edges, heights = _step_cells(e, l, finite)
+        return np.repeat(edges, 2)[1:-1], np.repeat(heights, 2)
     return e, l
 
 
-def plot_hypervolume(eta, loss, penalty, *, front=None, interpolation="step",
-                     space="linear", eta_range=(0.0, 1.0), show_anchor=True,
-                     ylabel=None, ax=None):
+def plot_hypervolume(eta, loss, reference, *, front=None, interpolation="step",
+                     space="linear", eta_range=(0.0, 1.0), ylabel=None, ax=None):
     """Draw the double-Pareto hypervolume decomposition of a front.
 
     The shaded regions are the two halves of ``hv = 1 - D / box``: the area between the
@@ -196,8 +193,8 @@ def plot_hypervolume(eta, loss, penalty, *, front=None, interpolation="step",
     eta, loss : ndarray
         Per-particle non-exceedance and **raw** loss, as returned by
         :meth:`~foresight_gpu.ensemble.ParetoEnsemble.front_objectives`.
-    penalty : float
-        Ceiling ``P``, in the units of ``space``.
+    reference : float
+        Reference (ceiling) ``R``, in the units of ``space`` -- e.g. ``gpu.hv_reference_``.
     front : sequence of int, optional
         Front-0 indices. Computed if omitted.
     interpolation : {"step", "linear"}
@@ -207,10 +204,6 @@ def plot_hypervolume(eta, loss, penalty, *, front=None, interpolation="step",
         areas faithful to the log-space integral.
     eta_range : tuple of float
         Span the indicator normalises over.
-    show_anchor : bool
-        In ``step`` mode, mark the anchor and connect it to the boundary. The anchor is the
-        one front point the staircase never touches: its cell has zero width, so the single
-        best model on the front contributes no area at all.
     ylabel : str, optional
         Y-axis label (defaults to ``"loss"``).
     ax : matplotlib axis, optional
@@ -221,7 +214,7 @@ def plot_hypervolume(eta, loss, penalty, *, front=None, interpolation="step",
     objectives = np.column_stack([eta, loss])
 
     parts = double_pareto_hypervolume(
-        objectives, penalty, interpolation=interpolation, space=space,
+        objectives, reference, interpolation=interpolation, space=space,
         eta_range=eta_range, front=front, details=True,
     )
     if front is None:
@@ -229,14 +222,14 @@ def plot_hypervolume(eta, loss, penalty, *, front=None, interpolation="step",
     idx = np.asarray(front, dtype=int).ravel()
     idx = idx[np.argsort(eta[idx], kind="stable")]
 
-    floor, ceiling = _hv_bounds(float(penalty), space)
+    floor, ceiling = _hv_bounds(float(reference), space)
     e = eta[idx]
     l = np.clip(loss[idx], floor, ceiling)
 
     ax.scatter(eta, np.clip(loss, floor, ceiling), s=6, color="0.75", label="population")
 
     if e.size >= 2:
-        xs, ys = _hv_boundary(e, l, interpolation)
+        xs, ys = _hv_boundary(e, l, np.isfinite(loss[idx]), interpolation)
         ax.fill_between(xs, ys, ceiling, color="tab:blue", alpha=0.18,
                         label="hypervolume  HV")
         ax.fill_between(xs, floor, ys, color="tab:orange", alpha=0.25,
@@ -245,18 +238,6 @@ def plot_hypervolume(eta, loss, penalty, *, front=None, interpolation="step",
         for lo, hi in ([eta_range[0], e[0]], [e[-1], eta_range[1]]):
             if hi > lo:
                 ax.axvspan(lo, hi, color="tab:red", alpha=0.15)
-
-        if show_anchor and interpolation == "step":
-            a = int(np.argmin(l))
-            reached = np.max(np.maximum(l[:-1], l[1:])[max(a - 1, 0):a + 1])
-            ax.plot([e[a], e[a]], [l[a], reached], ls=":", color="0.35", lw=1.2,
-                    zorder=6)
-            if e.size <= _ANCHOR_LABEL_MAX_FRONT:
-                # On a dense front the risers are sub-pixel and the label lands on the
-                # boundary, so the connector carries the point on its own.
-                ax.annotate("anchor: zero cell width,\ncontributes no area",
-                            xy=(e[a], l[a]), xytext=(6, -14),
-                            textcoords="offset points", fontsize=7, color="0.35")
 
     ax.scatter(e, l, s=18, color="tab:blue", zorder=5, label="front 0")
     ax.axhline(ceiling, color="k", ls="--", lw=1, label=f"ceiling  {ceiling:g}")
@@ -273,3 +254,67 @@ def plot_hypervolume(eta, loss, penalty, *, front=None, interpolation="step",
     ax.set_title(f"{space}, {interpolation}:  hv = {parts['hv']:.4f}")
     ax.legend(frameon=False, fontsize=8)
     return ax
+
+
+#: Panels of :func:`plot_history`: (key suffix, y label). ``hv`` comes from ``history_``,
+#: the rest from ``diagnostics_``.
+_HISTORY_PANELS = (
+    ("hv", "hypervolume"),
+    ("reliability", r"reliability $\alpha$"),
+    ("resolution", r"resolution $\pi$"),
+    ("crps", "CRPS"),
+)
+
+
+def plot_history(history, diagnostics=(), best_iteration=None, *, axes=None):
+    """Hypervolume and probabilistic diagnostics across generations, train vs validation.
+
+    Each panel is drawn from the record that owns it, at its own cadence: hypervolume from
+    ``history_`` (every check -- the curve early stopping read), reliability, resolution and
+    CRPS from ``diagnostics_`` (every ``diagnostics_every``, with markers so the sparser
+    sampling shows). Both are plain lists of flat dicts keyed by ``iteration``, so the same
+    figure is a few lines of ``pd.DataFrame(...).plot`` without this helper.
+
+    Parameters
+    ----------
+    history : list of dict
+        ``GPURegressor.history_``.
+    diagnostics : list of dict, optional
+        ``GPURegressor.diagnostics_``. Empty -> the hypervolume panel only. The row flagged
+        ``retained`` (the model ``predict`` uses) is drawn as a star.
+    best_iteration : int, optional
+        ``GPURegressor.best_iteration_``, marked on every panel.
+    axes : sequence of matplotlib axes, optional
+        One per panel drawn.
+
+    Returns
+    -------
+    ndarray of axes
+    """
+    panels = _HISTORY_PANELS if len(diagnostics) else _HISTORY_PANELS[:1]
+    if axes is None:
+        import matplotlib.pyplot as plt
+
+        _, axes = plt.subplots(len(panels), 1, sharex=True, squeeze=False,
+                               figsize=(7, 2.2 * len(panels)))
+    axes = np.asarray(axes).ravel()
+
+    for ax, (key, label) in zip(axes, panels):
+        rows = history if key == "hv" else diagnostics
+        it = np.array([r["iteration"] for r in rows])
+        for side, color in (("train", "darkcyan"), ("val", "firebrick")):
+            col = f"{side}_{key}"
+            if not rows or col not in rows[0]:
+                continue
+            values = np.array([r[col] for r in rows], dtype=float)
+            ax.plot(it, values, "-o", ms=3, color=color,
+                    label=side)
+            done = [r.get("retained", False) for r in rows]
+            if any(done):
+                ax.plot(it[done], values[done], "*", ms=11, color=color, zorder=5)
+        if best_iteration is not None:
+            ax.axvline(best_iteration, color="k", ls=":", lw=1)
+        ax.set_ylabel(label)
+    axes[0].legend(frameon=False, fontsize=8)
+    axes[len(panels) - 1].set_xlabel("generation")
+    return axes

@@ -46,14 +46,21 @@ class TestMLPModel:
         expected = _mlp_reference(X, p, 6, activation)
         np.testing.assert_allclose(got, expected, rtol=1e-10)
 
-    def test_regularizable_mask(self):
+    def test_weight_mask(self):
         m = MLPModel(n_hidden=3)
-        mask = m.regularizable_mask(2)
+        mask = m._weight_mask(2)
         assert mask.shape == (m.n_parameters(2),)
         assert mask[: 2 * 3].all()          # input->hidden
         assert mask[-4:-1].all()            # hidden->output
         assert not mask[2 * 3 : 2 * 3 + 3].any()  # hidden biases
         assert not mask[-1]                 # output bias
+
+    def test_regularization(self, rng):
+        p = rng.normal(size=(5, MLPModel(n_hidden=3).n_parameters(2)))
+        assert MLPModel(n_hidden=3).regularization(p, 2) == 0.0
+        m = MLPModel(n_hidden=3, reg_lambda=0.5, reg_p=2)
+        w = p[:, m._weight_mask(2)]
+        np.testing.assert_allclose(m.regularization(p, 2), 0.5 * np.sum(w ** 2, axis=1))
 
     def test_search_transform_roundtrip(self, rng):
         m = MLPModel()
@@ -107,8 +114,8 @@ class TestGR4JModel:
         b = m.forward(X, np.array([800.0, 2.0, 200.0, 3.0]))
         assert not np.allclose(a, b)
 
-    def test_no_regularization(self):
-        assert not GR4JModel().regularizable_mask(2).any()
+    def test_no_regularization(self, rng):
+        assert GR4JModel().regularization(rng.normal(size=(5, 4)), 2) == 0.0
 
     def test_more_rain_more_flow(self, rng):
         # Sanity: scaling precipitation up should not reduce total simulated flow.

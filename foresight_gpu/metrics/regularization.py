@@ -1,8 +1,8 @@
 """L-p regularisation of model parameters (WRR draft, Eq. 2).
 
-Adds a penalty on the (subset of) parameters flagged by a model's
-``regularizable_mask`` to the training loss, discouraging large weights. Vectorised over
-the particle axis so it can be added to the per-particle loss each generation.
+Helper for a forward model's ``regularization``: a penalty on a masked subset of
+parameters, discouraging large weights (used by ``MLPModel``). Vectorised over the
+particle axis so it can be added to the per-particle loss each generation.
 """
 
 import numpy as np

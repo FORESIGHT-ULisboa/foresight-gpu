@@ -8,12 +8,24 @@ and coverage cannot trade off invisibly — which is why it replaces the single-
 Two equivalent readings of the same quantity, both worth knowing:
 
 * **Penalised integral** (minimise) — ``D = integral of L(eta) over the covered span
-  + P * (uncovered span)``. ``P`` is the price of a unit of uncovered exceedance.
+  + R * (uncovered span)``. ``R`` is the price of a unit of uncovered exceedance.
 * **Hypervolume** (maximise) — the area between the front's staircase and a ceiling at
-  ``P``. ``HV = P - D``.
+  ``R``. ``HV = R - D``.
 
-They are algebraically identical. We report the normalised complement ``hv = 1 - D / P`` in
-``[0, 1]``, higher = better, to match the ``scoring`` contract in ``scoring.py``.
+They are algebraically identical. We report the normalised complement ``hv = 1 - D / R`` in
+``[0, 1]``, higher = better, to match the ``scoring`` contract in ``scoring.py``. ``R`` is the
+**reference point** of the hypervolume literature.
+
+Fixed vs adaptive reference
+---------------------------
+``hv`` is only comparable between fronts scored under the same ``R``. A fixed ``R`` gives
+that for free but must be chosen in advance. The estimator's default is **adaptive**:
+``R = HV_REFERENCE_MARGIN * nadir``, the nadir being the worst front-0 loss over *every*
+front seen so far (:func:`reference_nadir`), and every stored front is rescored whenever
+``R`` moves. Tracking the worst particle *without* rescoring is fatal: on a front that never
+changes hv goes 0.50 -> 0.75 -> 0.875 -> 0.975 as R grows 1 -> 2 -> 4 -> 20, so a monitor
+would report improvement whenever the swarm found something worse. Because ``R`` bounds
+every stored loss, nothing is clipped, and each front's hv is linear in ``1/R``.
 
 Conventions
 -----------
@@ -29,17 +41,17 @@ The caller never passes a log loss; the module transforms it. Two spaces, one bo
 ===========  ==================  ==========  =============  ====================
 ``space``    axis                floor ``F``  ceiling        box height
 ===========  ==================  ==========  =============  ====================
-``linear``   ``L``               ``0``        ``P``          ``P``
-``log10``    ``log10(L)``        ``-P``       ``P``          ``2P``
+``linear``   ``L``               ``0``        ``R``          ``R``
+``log10``    ``log10(L)``        ``-R``       ``R``          ``2R``
 ===========  ==================  ==========  =============  ====================
 
-``log10`` is **symmetric**: ``P`` is read as an absolute bound on ``|log10 L|``, so ``P=2``
+``log10`` is **symmetric**: ``R`` is read as an absolute bound on ``|log10 L|``, so ``R=2``
 means raw loss in ``[1e-2, 1e2]`` and needs no second parameter. A front sitting at loss 1
 everywhere -- the no-skill line for NSE/KGE -- scores exactly ``hv = 0.5``, which is the
 anchor that makes the number readable.
 
 **Why it is offered.** Linear space spends almost the whole box on losses nobody cares
-about: at the default ``P=100`` the interesting region (losses of order 1) is a hundredth of
+about: at the default ``R=100`` the interesting region (losses of order 1) is a hundredth of
 the axis, so fronts that differ where it matters score almost the same. Measured on this
 repo's synthetic problem the usable ``hv`` range was **2-7x wider** in log10 (2.3x over one
 run's early-stopping trace, 6.9x over converged fronts at 5..160 generations); the factor
@@ -49,7 +61,7 @@ depends on which fronts are compared, the direction does not.
 floored at ``tiny`` and carries the ``_BAD_LOSS`` sentinel, which is unbounded below and
 meaningless to integrate. The bound here is the symmetric clip, not a sentinel. Every metric
 in the registry has ``Metric.loss >= 0`` with optimum exactly 0, so ``log10`` is defined
-everywhere except at 0 -- and a loss of exactly 0 clips to the floor ``-P``, taking maximum
+everywhere except at 0 -- and a loss of exactly 0 clips to the floor ``-R``, taking maximum
 credit, which is correct.
 
 Because ``log10`` is monotone, **front 0 is identical in both spaces**: the transform is
@@ -60,17 +72,28 @@ Load-bearing property of the sorter
 ``_double_pareto`` consumes points in ascending loss and only ever *extends* the span, so
 **front 0 comes back eta-ordered and V-shaped**: loss falls monotonically to the anchor,
 then rises. Verified on 500/500 random populations. This is what makes the 2-D integral a
-single ``np.diff`` and what forces the staircase height to be ``max(l_i, l_i+1)`` — see
-:func:`double_pareto_hypervolume`.
+single pass over consecutive cells — see :func:`_step_cells`.
+
+The step staircase
+------------------
+The standard hypervolume gives each cell ``max(l_i, l_i+1)``, the *outer* point on the V.
+Every point then owns one cell except the lowest-loss one, which owns zero width: a front
+where only the best model improves scored the same. So the two cells beside the minimum are
+split at their eta-midpoint, the inner half taking the minimum loss (not toward a failed,
+non-finite neighbour, which would credit the gap to it). The result is the
+standard (split-half) hypervolume plus those two half-cells, exactly
+(``test_step_equals_split_hypervolume_plus_midpoint_cells``). Lowering any front loss now
+raises ``hv``; the price is that inserting a point next to the minimum shrinks its
+half-cells, so monotonicity under insertion is lost in those two cells only.
 
 Two rejected alternatives, recorded so they are not re-derived
 --------------------------------------------------------------
 * **Joining consecutive front points per eta cell** (the obvious k-dimensional
-  generalisation) is **non-monotone**. With k=2, ``P=(20, 20)`` and front
+  generalisation) is **non-monotone**. With k=2, ``R=(20, 20)`` and front
   ``A=(0.2, (0,10))``, ``B=(0.8, (10,0))`` the indicator is 60; inserting one mediocre
   point ``D=(0.21, (19,19))`` collapses it to 0.6. Use the anchor split instead.
 * **Choosing the split point by maximising HV_left + HV_right** over-credits: on front
-  ``(0,1), (0.3,0), (1,1)`` with ``P=1`` the true value is 0, but splitting at ``s=1.0``
+  ``(0,1), (0.3,0), (1,1)`` with ``R=1`` the true value is 0, but splitting at ``s=1.0``
   lets the anchor's low loss leak across cells and reports 0.7. The split must be the
   anchor.
 """
@@ -82,32 +105,39 @@ from .double_pareto import DoubleParetoSorter
 __all__ = [
     "hypervolume",
     "double_pareto_hypervolume",
-    "default_hv_penalty",
+    "default_hv_reference",
     "non_dominated_mask",
-    "DEFAULT_HV_PENALTY",
-    "DEFAULT_HV_LOG_PENALTY",
+    "DEFAULT_HV_REFERENCE",
+    "DEFAULT_HV_LOG_REFERENCE",
     "HV_CLIP_WARN_FRACTION",
+    "HV_REFERENCE_MARGIN",
+    "reference_nadir",
 ]
 
-#: Default hypervolume ceiling ``P`` in ``space="linear"``. A deliberate constant, **not** a
-#: climatology: GPU's extreme-eta particles are *meant* to be biased (a particle at eta~0.95
+#: Fixed hypervolume ceiling ``R`` in ``space="linear"``, used when no reference is given
+#: (e.g. an ensemble built by hand). Deliberately **not** a climatology: GPU's extreme-eta particles are *meant* to be biased (a particle at eta~0.95
 #: has to systematically over-predict), so they score below the no-skill line by construction
 #: -- 80% of front-0 measured worse than climatology, loss quartiles [0.81, 1.10, 1.64, 2.21,
 #: 6.36]. A ceiling at 1.0 clips away exactly the particles that give the distribution its
-#: width. Measured usable hv range: 5.4e-2 at P=100 against 2.7e-2 at P=1.
-DEFAULT_HV_PENALTY = 100.0
+#: width. Measured usable hv range: 5.4e-2 at R=100 against 2.7e-2 at R=1.
+DEFAULT_HV_REFERENCE = 100.0
 
-#: Default ceiling in ``space="log10"``, where ``P`` is read in log units: the box is raw
+#: Default ceiling in ``space="log10"``, where ``R`` is read in log units: the box is raw
 #: loss in ``[1e-2, 1e2]``. A separate constant because the two spaces need numbers orders of
 #: magnitude apart -- reusing 100.0 here would mean a box of ``[1e-100, 1e100]``, inside which
 #: every real front is flat and the indicator has no gradient at all.
-DEFAULT_HV_LOG_PENALTY = 2.0
+DEFAULT_HV_LOG_REFERENCE = 2.0
 
 #: Fraction of front-0 at the ceiling above which the indicator is reported as too tight.
 #: Clipping is correct behaviour (no gradient among models you would never use), but past
 #: this share of the front it stops responding to real improvements, so it is worth saying
-#: out loud. Measured at the NSE climatology ceiling P=1: ~0.8-0.9 of front-0 clipped.
+#: out loud. Measured at the NSE climatology ceiling R=1: ~0.8-0.9 of front-0 clipped.
 HV_CLIP_WARN_FRACTION = 0.25
+
+#: Margin on the adaptive reference, ``R = margin * nadir`` (Ishibuchi et al., 2018). With
+#: ``R`` exactly at the nadir the worst front point sits on the ceiling, and under the step
+#: rule its whole outer cell contributes zero area -- hiding the extreme-eta tail.
+HV_REFERENCE_MARGIN = 1.1
 
 
 def non_dominated_mask(points):
@@ -186,20 +216,20 @@ def hypervolume(points, reference):
     return float(total)
 
 
-def default_hv_penalty(metric, obs, predictor=None):
-    """Default penalty ``P`` — the cost of a unit of uncovered exceedance.
+def default_hv_reference(metric, obs, predictor=None):
+    """Default reference ``R`` — the cost of a unit of uncovered exceedance.
 
-    ``P`` is a cost *in the units of the loss*, so it can only be a constant where the loss
+    ``R`` is a cost *in the units of the loss*, so it can only be a constant where the loss
     is dimensionless:
 
-    * ``greater_is_better`` metrics (NSE, KGE, KGE') have ``loss = 1 - value``, so ``P = 1``
+    * ``greater_is_better`` metrics (NSE, KGE, KGE') have ``loss = 1 - value``, so ``R = 1``
       is exactly the metric-value-0 no-skill line.
-    * error metrics (MAE, MSE, RMSE) carry the units of ``y``, so ``P`` is the loss of the
+    * error metrics (MAE, MSE, RMSE) carry the units of ``y``, so ``R`` is the loss of the
       constant forecast: ``var(obs)`` for MSE, ``std(obs)`` for RMSE, ``mean|obs - mu|`` for
       MAE.
 
     The two branches are the same rule. ``NSE = 1 - MSE / var(y)``, so
-    ``nse.loss == mse.loss / default_hv_penalty(mse, y)`` — the constant-predictor loss *is*
+    ``nse.loss == mse.loss / default_hv_reference(mse, y)`` — the constant-predictor loss *is*
     NSE's denominator, and this simply gives the error metrics the normalisation NSE already
     has built in.
 
@@ -226,6 +256,24 @@ def default_hv_penalty(metric, obs, predictor=None):
     return float(metric.loss(np.full(obs.shape, mu), obs))
 
 
+def reference_nadir(loss, space="linear"):
+    """Worst finite front loss in ``space`` units: the nadir the adaptive reference scales.
+
+    ``linear`` returns ``max(loss)``; ``log10`` returns ``max(|log10 loss|)``, since its box
+    is symmetric ``[-R, R]``. Losses of 0 and non-finite losses are ignored: they clip to the
+    floor / ceiling whatever ``R`` is. Returns 0.0 when nothing qualifies.
+    """
+    loss = np.asarray(loss, dtype=float).ravel()
+    if space == "log10":
+        loss = loss[np.isfinite(loss) & (loss > 0.0)]
+        values = np.abs(np.log10(loss))
+    elif space == "linear":
+        values = loss[np.isfinite(loss)]
+    else:
+        raise ValueError(f"space must be 'linear' or 'log10', got {space!r}.")
+    return float(values.max()) if values.size else 0.0
+
+
 def _front_zero(eta, losses):
     """Indices of the non-dominated front over the mirrored surface."""
     if losses.shape[1] == 1:
@@ -241,24 +289,47 @@ def _front_zero(eta, losses):
     return np.flatnonzero(keep)
 
 
-def _split_hypervolume(eta, losses, penalty, eta_split):
-    """Framing B: two standard minimisation hypervolumes, disjoint in eta, summed."""
+def _step_cells(e, col, finite):
+    """Step staircase of an eta-ordered front (``m >= 2``) -> ``(edges, heights)``.
+
+    ``max(l_i, l_i+1)`` per cell, except the cells beside the minimum, which are split at
+    the midpoint with the inner half at the minimum loss (see the module docstring).
+    ``finite`` flags particles with a finite raw loss: a failed neighbour is not a model,
+    so its cell is not split (else the gap to it would be credited at the minimum).
+    """
+    a = int(np.argmin(col))
+    edges = list(e)
+    heights = list(np.maximum(col[:-1], col[1:]))
+    if a < e.size - 1 and finite[a + 1]:
+        edges.insert(a + 1, 0.5 * (e[a] + e[a + 1]))
+        heights[a:a + 1] = [col[a], col[a + 1]]
+    if a > 0 and finite[a - 1]:
+        edges.insert(a, 0.5 * (e[a - 1] + e[a]))
+        heights[a - 1:a] = [col[a - 1], col[a]]
+    return np.asarray(edges, dtype=float), np.asarray(heights, dtype=float)
+
+
+def _split_hypervolume(eta, losses, reference, eta_split):
+    """Framing B: two standard minimisation hypervolumes, disjoint in eta, summed.
+
+    The plain split hypervolume, without the midpoint cells of the 1-loss step rule.
+    """
     if eta_split is None:
         # The anchor: the front point with the largest single-point box. Reduces to
         # argmin(loss) when k == 1. Choosing the split to maximise the total instead
         # over-credits (see the module docstring).
-        eta_split = float(eta[int(np.argmax(np.prod(penalty - losses, axis=1)))])
+        eta_split = float(eta[int(np.argmax(np.prod(reference - losses, axis=1)))])
     total = 0.0
     for sign, half in ((1.0, eta <= eta_split), (-1.0, eta >= eta_split)):
         idx = np.flatnonzero(half)
         if idx.size == 0:
             continue
         pts = np.column_stack([sign * eta[idx], losses[idx]])
-        total += hypervolume(pts, np.concatenate(([sign * eta_split], penalty)))
+        total += hypervolume(pts, np.concatenate(([sign * eta_split], reference)))
     return total
 
 
-def double_pareto_hypervolume(objectives, penalty, *, interpolation="step",
+def double_pareto_hypervolume(objectives, reference, *, interpolation="step",
                               space="linear", eta_range=(0.0, 1.0), front=None,
                               eta_split=None, details=False):
     """Mirrored hypervolume indicator of a population, normalised to ``[0, 1]``.
@@ -267,25 +338,26 @@ def double_pareto_hypervolume(objectives, penalty, *, interpolation="step",
     ----------
     objectives : ndarray
         ``[m, 1 + k]``; column 0 is eta, columns ``1:`` are **raw** losses (not log).
-    penalty : float or sequence of float
-        ``P`` per loss axis — the ceiling, equivalently the price of a unit of uncovered
-        exceedance, **in the units of** ``space``. See :func:`default_hv_penalty`. With
-        ``space="log10"`` it is a bound on ``|log10 L|``, so ``P=2`` is a raw loss of 100;
+    reference : float or sequence of float
+        ``R`` per loss axis — the ceiling, equivalently the price of a unit of uncovered
+        exceedance, **in the units of** ``space``. See :func:`default_hv_reference`. With
+        ``space="log10"`` it is a bound on ``|log10 L|``, so ``R=2`` is a raw loss of 100;
         the two spaces therefore want values orders of magnitude apart
-        (:data:`DEFAULT_HV_PENALTY` against :data:`DEFAULT_HV_LOG_PENALTY`).
+        (:data:`DEFAULT_HV_REFERENCE` against :data:`DEFAULT_HV_LOG_REFERENCE`).
     space : {"linear", "log10"}
         Axis the loss is integrated on. ``"log10"`` uses a **symmetric** box, clipping
-        ``log10(L)`` to ``[-P, P]``, which spreads the low-loss region the linear axis
+        ``log10(L)`` to ``[-R, R]``, which spreads the low-loss region the linear axis
         compresses (measured 6.9x more usable range). Pass the **raw** loss either way.
         See the module docstring.
     interpolation : {"step", "linear"}
-        ``"step"`` is the standard hypervolume: the staircase height over a cell is
-        ``max(l_i, l_i+1)``. That is **forced, not a style choice** — it is what makes the
-        closed form equal the split-half hypervolume (matched to 2.2e-16 over 2000 random
-        fronts; the ``min`` rule is off by up to 0.84). ``"linear"`` averages the two
-        endpoints instead: an optimistic smoothing with no hypervolume interpretation, less
-        sensitive to how many particles happen to land on the front. Always
-        ``hv(linear) >= hv(step)``. 1 loss axis only.
+        ``"step"``: the staircase height over a cell is ``max(l_i, l_i+1)``, except the two
+        cells beside the minimum, split at their midpoint with the inner half at the
+        minimum loss. That is the split-half hypervolume plus those half-cells, and gives
+        every front point positive width (see the module docstring). With ``k > 1`` it is
+        the plain split hypervolume. ``"linear"`` averages the two endpoints instead: an
+        optimistic smoothing with no hypervolume interpretation, less sensitive to how
+        many particles happen to land on the front. Always ``hv(linear) >= hv(step)``
+        (equal on the two split cells). 1 loss axis only.
     eta_range : tuple of float
         Span the indicator normalises over. eta outside it is clipped.
     front : sequence of int, optional
@@ -299,15 +371,15 @@ def double_pareto_hypervolume(objectives, penalty, *, interpolation="step",
     -------
     float or dict
         ``hv`` in ``[0, 1]``, higher = better. With ``details``, also ``dispersion``
-        (``1 - hv``), ``integral`` (``D``), ``penalty``, ``space``, ``coverage``,
+        (``1 - hv``), ``integral`` (``D``), ``reference``, ``space``, ``coverage``,
         ``clipped_fraction``, ``eta_min``, ``eta_max``, ``n_front`` and ``front_min_loss``.
 
     Notes
     -----
-    Losses are clipped to ``[F, P]`` (``F = 0`` linear, ``-P`` log10): a particle worse than
-    the penalty rate is no better than a gap, and a (non-registry) negative loss would
+    Losses are clipped to ``[F, R]`` (``F = 0`` linear, ``-R`` log10): a particle worse than
+    the reference is no better than a gap, and a (non-registry) negative loss would
     otherwise push ``hv`` above 1. Non-finite losses become ``+inf``, so failed particles
-    clip to ``P`` and contribute exactly zero area — they lengthen the covered span at zero
+    clip to ``R`` and contribute exactly zero area — they lengthen the covered span at zero
     height.
 
     ``clipped_fraction`` reports the share of front-0 sitting at the ceiling, failed
@@ -325,11 +397,11 @@ def double_pareto_hypervolume(objectives, penalty, *, interpolation="step",
         raise ValueError(f"space must be 'linear' or 'log10', got {space!r}.")
 
     n_loss = objectives.shape[1] - 1
-    P = np.broadcast_to(
-        np.atleast_1d(np.asarray(penalty, dtype=float)), (n_loss,)
+    R = np.broadcast_to(
+        np.atleast_1d(np.asarray(reference, dtype=float)), (n_loss,)
     ).astype(float)
-    if not np.all(np.isfinite(P)) or np.any(P <= 0.0):
-        raise ValueError(f"penalty must be finite and > 0 on every loss axis, got {P}.")
+    if not np.all(np.isfinite(R)) or np.any(R <= 0.0):
+        raise ValueError(f"reference must be finite and > 0 on every loss axis, got {R}.")
 
     lo, hi = float(eta_range[0]), float(eta_range[1])
     span = hi - lo
@@ -351,30 +423,29 @@ def double_pareto_hypervolume(objectives, penalty, *, interpolation="step",
     if space == "log10":
         with np.errstate(divide="ignore"):
             axis = np.log10(raw[idx][order])   # loss 0 -> -inf, clipped to the floor
-        floor = -P
+        floor = -R
     else:
         axis = raw[idx][order]
-        floor = np.zeros_like(P)
-    ell = np.clip(axis, floor, P)
-    clipped_fraction = float(np.mean(axis >= P)) if axis.size else 0.0
+        floor = np.zeros_like(R)
+    ell = np.clip(axis, floor, R)
+    clipped_fraction = float(np.mean(axis >= R)) if axis.size else 0.0
 
-    box = float(np.prod(P - floor)) * span
+    box = float(np.prod(R - floor)) * span
     if e.size < 2:
         hv_abs = 0.0
     elif n_loss == 1:
-        width = np.diff(e)
         col = ell[:, 0]
         if interpolation == "step":
-            height = np.maximum(col[:-1], col[1:])
+            edges, height = _step_cells(e, col, np.isfinite(raw[idx][order][:, 0]))
         else:
-            height = 0.5 * (col[:-1] + col[1:])
-        hv_abs = float(np.sum(width * (P[0] - height)))
+            edges, height = e, 0.5 * (col[:-1] + col[1:])
+        hv_abs = float(np.sum(np.diff(edges) * (R[0] - height)))
     else:
         if interpolation != "step":
             raise NotImplementedError(
                 "interpolation='linear' is defined for a single loss axis only."
             )
-        hv_abs = _split_hypervolume(e, ell, P, eta_split)
+        hv_abs = _split_hypervolume(e, ell, R, eta_split)
 
     hv = hv_abs / box
     if not details:
@@ -383,7 +454,7 @@ def double_pareto_hypervolume(objectives, penalty, *, interpolation="step",
         "hv": hv,
         "dispersion": 1.0 - hv,
         "integral": (1.0 - hv) * box,
-        "penalty": float(P[0]) if n_loss == 1 else tuple(float(v) for v in P),
+        "reference": float(R[0]) if n_loss == 1 else tuple(float(v) for v in R),
         "space": space,
         "coverage": float(e[-1] - e[0]) / span if e.size else 0.0,
         "clipped_fraction": clipped_fraction,

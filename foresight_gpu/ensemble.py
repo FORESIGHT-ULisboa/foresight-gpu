@@ -15,8 +15,8 @@ import warnings
 import numpy as np
 
 from .domination import (
-    DEFAULT_HV_LOG_PENALTY,
-    DEFAULT_HV_PENALTY,
+    DEFAULT_HV_LOG_REFERENCE,
+    DEFAULT_HV_REFERENCE,
     HV_CLIP_WARN_FRACTION,
     DoubleParetoSorter,
     double_pareto_hypervolume,
@@ -111,19 +111,21 @@ class ParetoEnsemble:
         ``metric=`` to re-read the same front under any other metric. Stored as given;
         ``Metric`` reduces to a plain ``str`` on pickling and is re-resolved with
         ``get_metric`` on use.
-    hv_penalty : float or None
-        Hypervolume ceiling ``P``, **already resolved** (scale applied, ``"climatology"``
-        expanded), in the units of ``hv_space``. ``None`` -> the default for that space.
+    hv_reference : float or None
+        Hypervolume reference (ceiling) ``R``, **already resolved** (scale applied,
+        ``"climatology"`` / ``"adaptive"`` expanded), in the units of ``hv_space``. ``None``
+        -> the fixed default for that space. After an adaptive fit this is the final
+        reference, so ``score_hypervolume`` on the validation window reproduces ``history_``.
     hv_interpolation : {"step", "linear"}
         Default integration rule for :meth:`score_hypervolume`.
     hv_space : {"linear", "log10"}
         Default objective space for :meth:`score_hypervolume`. ``"log10"`` integrates
-        ``log10(loss)`` in a symmetric ``[-P, P]`` box.
+        ``log10(loss)`` in a symmetric ``[-R, R]`` box.
     """
 
     def __init__(self, model, params, exceedances,
                  quantiles=DEFAULT_QUANTILES, band_width=0.025, min_models=1,
-                 force_positive=False, metric=None, hv_penalty=None,
+                 force_positive=False, metric=None, hv_reference=None,
                  hv_interpolation="step", hv_space="linear"):
         self.model = model
         self.params = np.asarray(params, dtype=float)
@@ -133,7 +135,7 @@ class ParetoEnsemble:
         self.min_models = min_models
         self.force_positive = force_positive
         self.metric = metric
-        self.hv_penalty = hv_penalty
+        self.hv_reference = hv_reference
         self.hv_interpolation = hv_interpolation
         self.hv_space = hv_space
         self.band_bounds = band_bounds(self.quantiles, band_width)
@@ -151,23 +153,25 @@ class ParetoEnsemble:
 
     def predict_quantiles(self, X, quantiles=None, post_process=True):
         """Predicted band values, shape ``[n_samples, n_quantiles]`` (NaN where invalid)."""
+        sims, valid = self._simulate(X)
+        agg = self._bands_from_sims(sims, quantiles, post_process)
+        out = np.full((valid.shape[0], agg.shape[1]), np.nan)
+        out[valid] = agg
+        return out
+
+    def _bands_from_sims(self, sims, quantiles=None, post_process=True):
+        """Band matrix from simulations already in hand, so a caller that also needs the
+        front (the fit loop) pays one ``forward`` instead of two."""
         if quantiles is None:
             quantiles = self.quantiles
             bounds = self.band_bounds
         else:
             quantiles = list(quantiles)
             bounds = band_bounds(quantiles, self.band_width)
-
-        sims, valid = self._simulate(X)
         agg = aggregate_by_band(
             sims, self.exceedances, bounds, self.min_models, self.force_positive
         )
-        if post_process:
-            agg = post_process_bands(agg, quantiles)
-
-        out = np.full((valid.shape[0], len(quantiles)), np.nan)
-        out[valid] = agg
-        return out
+        return post_process_bands(agg, quantiles) if post_process else agg
 
     def predict(self, X):
         """Point estimate: the band nearest non-exceedance 0.5, shape ``[n_samples]``."""
@@ -225,19 +229,23 @@ class ParetoEnsemble:
 
         Notes
         -----
-        The loss is computed from the simulations, so the Lp regularisation term (which
-        penalises parameters, not held-out fit) cannot reach it by construction.
+        The loss is computed from the simulations, so the model's ``regularization`` term
+        (which penalises parameters, not held-out fit) cannot reach it by construction.
 
         Rows are dropped where **either** ``X`` or ``y`` is non-finite. ``_simulate``
         masks only ``X``; a single NaN in ``y`` would otherwise make ``metric.loss`` NaN
-        for every particle, clipping them all to ``P`` and reporting ``hv == 0`` silently.
+        for every particle, clipping them all to ``R`` and reporting ``hv == 0`` silently.
         """
-        metric = self._resolve_metric(metric)
         y = np.asarray(y, dtype=float).ravel()
         sims, valid = self._simulate(X)
         if y.shape[0] != valid.shape[0]:
             raise ValueError(f"X has {valid.shape[0]} rows but y has {y.shape[0]}.")
-        yv = y[valid]
+        return self._front_from_sims(sims, y[valid], metric)
+
+    def _front_from_sims(self, sims, y, metric=None):
+        """:meth:`front_objectives` on simulations already in hand (rows aligned with ``y``)."""
+        metric = self._resolve_metric(metric)
+        yv = np.asarray(y, dtype=float).ravel()
         finite = np.isfinite(yv)
         if not finite.all():
             sims, yv = sims[finite], yv[finite]
@@ -254,13 +262,14 @@ class ParetoEnsemble:
         )
         return eta, loss, front
 
-    def score_hypervolume(self, X, y, metric=None, *, penalty=None, interpolation=None,
+    def score_hypervolume(self, X, y, metric=None, *, reference=None, interpolation=None,
                           space=None, details=False):
         """Double-Pareto hypervolume of this front on ``(X, y)``, in ``[0, 1]``.
 
         Higher = better. Unlike the band-based scorers this measures the **front**, so it
         re-simulates the retained models rather than calling ``predict_quantiles`` — which
-        is also why it is cheaper than they are.
+        is also why it is cheaper than they are. The reference is always **fixed** here:
+        this is the diagnostic reading of one front, not the fit-time monitor.
 
         Parameters
         ----------
@@ -270,15 +279,17 @@ class ParetoEnsemble:
             Defaults to the calibration metric. Passing another re-reads the *same* fitted
             front under it, which is how a front calibrated on NSE can be examined under
             KGE or MAE after the fact.
-        penalty : float, optional
-            Ceiling ``P``, in the units of ``space``. Defaults to :attr:`hv_penalty`, else
-            the default for the resolved space.
+        reference : float, optional
+            Ceiling ``R``, in the units of ``space``. Defaults to :attr:`hv_reference` when
+            ``metric`` and ``space`` are the calibration ones (it carries their units), else
+            to the fixed default for the resolved space. Pass the same value to compare
+            fronts from different fits: each adaptive fit ends on its own reference.
         interpolation : {"step", "linear"}, optional
             Defaults to :attr:`hv_interpolation`.
         space : {"linear", "log10"}, optional
             Objective space. Defaults to :attr:`hv_space`. Pass ``"log10"`` to re-read the
             same front on a log loss axis — the usual reason being that the linear box
-            compresses the region you care about. ``penalty`` is then a bound on
+            compresses the region you care about. ``reference`` is then a bound on
             ``|log10 loss|``, so it wants a much smaller number.
         details : bool
             Return the decomposition dict instead of a float.
@@ -286,48 +297,62 @@ class ParetoEnsemble:
         Warns
         -----
         UserWarning
-            When the ceiling has swallowed the whole front (``hv`` pinned at 0, no gradient
-            to stop on), or when it clips more than
-            :data:`~foresight_gpu.domination.HV_CLIP_WARN_FRACTION` of front-0 — at which
-            point improvements in the clipped part are invisible to the indicator.
+            When the ceiling has swallowed the whole front (``hv`` pinned at 0), or when it
+            clips more than :data:`~foresight_gpu.domination.HV_CLIP_WARN_FRACTION` of
+            front-0 — at which point improvements in the clipped part are invisible.
         """
         metric = self._resolve_metric(metric)
         eta, loss, front = self.front_objectives(X, y, metric)
 
         # getattr throughout: ensembles pickled before these attributes existed still load.
-        space = space or getattr(self, "hv_space", "linear")
-        if penalty is None:
-            penalty = getattr(self, "hv_penalty", None)
-        if penalty is None:
-            penalty = DEFAULT_HV_LOG_PENALTY if space == "log10" else DEFAULT_HV_PENALTY
-        P = float(penalty)
+        own_space = getattr(self, "hv_space", "linear")
+        space = space or own_space
+        # The stored reference is in the calibration metric's loss units and space, so it
+        # only applies to that reading; any other falls back to the fixed default.
+        calibrated = getattr(self, "metric", None)
+        same_reading = (space == own_space and calibrated is not None
+                        and get_metric(calibrated) == metric)
+        if reference is None and same_reading:
+            reference = getattr(self, "hv_reference", getattr(self, "hv_penalty", None))
+        if reference is None:
+            reference = (
+                DEFAULT_HV_LOG_REFERENCE if space == "log10" else DEFAULT_HV_REFERENCE
+            )
+        R = float(reference)
 
         parts = double_pareto_hypervolume(
-            np.column_stack([eta, loss]), P, front=front,
+            np.column_stack([eta, loss]), R, front=front,
             interpolation=interpolation or getattr(self, "hv_interpolation", "step"),
             space=space, details=True,
         )
-
-        # Two rungs, worst first. Individual tail particles above P are the normal regime --
-        # the extreme-eta ones are *meant* to be biased -- which is why neither rung fires on
-        # a healthy front. Both texts are constant across checks, so Python's warning dedup
-        # emits each once per fit rather than once per generation.
-        clipped = parts["clipped_fraction"]
-        ceiling = f"P={P:g}" + (f" (raw loss {10 ** P:g})" if space == "log10" else "")
-        if clipped >= 1.0:
-            warnings.warn(
-                f"Every front-0 loss exceeds the hypervolume ceiling {ceiling} under metric "
-                f"{metric} in {space} space, so hv is pinned at 0 and early stopping cannot "
-                f"discriminate. Raise hv_penalty above the plausible {metric} loss scale.",
-                UserWarning,
-            )
-        elif clipped > HV_CLIP_WARN_FRACTION:
-            warnings.warn(
-                f"The hypervolume ceiling {ceiling} clips {clipped:.0%} of front-0 under "
-                f"metric {metric} in {space} space, so the indicator cannot see improvements "
-                f"in that part of the front. Raise hv_penalty, or use hv_space='log10' to "
-                f"spread the loss axis. Tracked as 'clipped_fraction' in history_.",
-                UserWarning,
-            )
-
+        _warn_if_clipped(parts, metric)
         return parts if details else parts["hv"]
+
+
+def _warn_if_clipped(parts, metric):
+    """Warn when a fixed reference clips the whole front, or more than
+    :data:`HV_CLIP_WARN_FRACTION` of it.
+
+    Individual tail particles above ``R`` are the normal regime -- the extreme-eta ones are
+    *meant* to be biased -- so neither rung fires on a healthy front. Both texts are constant
+    across checks, so Python's warning dedup emits each once per fit.
+    """
+    clipped, R, space = parts["clipped_fraction"], parts["reference"], parts["space"]
+    ceiling = f"R={R:g}" + (f" (raw loss {10 ** R:g})" if space == "log10" else "")
+    if clipped >= 1.0:
+        warnings.warn(
+            f"Every front-0 loss exceeds the hypervolume reference {ceiling} under metric "
+            f"{metric} in {space} space, so hv is pinned at 0 and early stopping cannot "
+            f"discriminate. Raise hv_reference above the plausible {metric} loss scale, or "
+            f"use hv_reference='adaptive'.",
+            UserWarning,
+        )
+    elif clipped > HV_CLIP_WARN_FRACTION:
+        warnings.warn(
+            f"The hypervolume reference {ceiling} clips {clipped:.0%} of front-0 under "
+            f"metric {metric} in {space} space, so the indicator cannot see improvements "
+            f"in that part of the front. Raise hv_reference, use hv_reference='adaptive', "
+            f"or use hv_space='log10' to spread the loss axis. Tracked as "
+            f"'*_clipped_fraction' in history_.",
+            UserWarning,
+        )

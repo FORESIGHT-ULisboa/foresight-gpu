@@ -7,7 +7,7 @@ the parameters. It subclasses :class:`sklearn.base.BaseEstimator` only for
 
 To bring your own model, subclass :class:`BaseForwardModel` and implement
 :meth:`n_parameters` and :meth:`forward`; override :meth:`parameter_bounds`,
-:meth:`regularizable_mask` and the search transform as needed.
+:meth:`regularization` and the search transform as needed.
 
 Shapes (the advertised contract):
 
@@ -67,9 +67,14 @@ class BaseForwardModel(BaseEstimator, ABC):
         k = self.n_parameters(n_features)
         return np.full(k, -DEFAULT_BOUND), np.full(k, DEFAULT_BOUND)
 
-    def regularizable_mask(self, n_features):
-        """Boolean mask of parameters the L-p penalty applies to (default: all)."""
-        return np.ones(self.n_parameters(n_features), dtype=bool)
+    def regularization(self, params, n_features):
+        """Per-particle regularisation term added to the training loss.
+
+        ``params`` is in *model* space, shape ``[n_particles, n_params]``. Return an array
+        ``[n_particles]`` or a scalar; the default ``0.0`` means no regularisation. Only the
+        training loss sees it — held-out loss and hypervolume are computed from simulations.
+        """
+        return 0.0
 
     def search_transform(self, params):
         """Map parameters from *search* space to *model* space (default: identity)."""

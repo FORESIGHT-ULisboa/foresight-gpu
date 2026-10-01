@@ -9,7 +9,7 @@ import pytest
 from foresight_gpu.domination import (
     HV_CLIP_WARN_FRACTION,
     DoubleParetoSorter,
-    default_hv_penalty,
+    default_hv_reference,
     double_pareto_hypervolume,
     hypervolume,
     non_dominated_mask,
@@ -32,10 +32,11 @@ def _random_front(seed, n_max=60):
 # --- the indicator, analytic ---------------------------------------------------------
 
 def test_worked_example():
-    """Front (0.1, 0.8), (0.4, 0.2), (0.9, 0.5) with P = 1 integrates to D = 0.69."""
+    """Front (0.1, 0.8), (0.4, 0.2), (0.9, 0.5) with R = 1 integrates to D = 0.525."""
     obj = np.array([[0.1, 0.8], [0.4, 0.2], [0.9, 0.5]])
-    # D = 0.1*1 (uncovered) + 0.3*0.8 + 0.5*0.5 + 0.1*1 (uncovered)
-    assert double_pareto_hypervolume(obj, 1.0) == pytest.approx(0.31)
+    # Cells beside the minimum split at 0.25 and 0.65:
+    # D = 0.1*1 (uncovered) + 0.15*0.8 + 0.15*0.2 + 0.25*0.2 + 0.25*0.5 + 0.1*1 (uncovered)
+    assert double_pareto_hypervolume(obj, 1.0) == pytest.approx(0.475)
 
 
 def test_full_coverage_zero_loss_is_one():
@@ -55,7 +56,7 @@ def test_uncovered_span_is_penalised():
     assert narrow == pytest.approx(0.5 * wide)
 
 
-def test_losses_clipped_at_penalty():
+def test_losses_clipped_at_reference():
     """A particle worse than P is worth exactly as much as one sitting at P: nothing."""
     at_p = np.array([[0.1, 1.0], [0.4, 0.2], [0.9, 1.0]])
     beyond = np.array([[0.1, 10.0], [0.4, 0.2], [0.9, 10.0]])
@@ -85,7 +86,7 @@ def test_indicator_is_bounded():
         assert 0.0 <= hv <= 1.0
 
 
-def test_penalty_scales_out_for_dimensionless_losses():
+def test_reference_scales_out_for_dimensionless_losses():
     """Doubling both P and every loss leaves the normalised indicator unchanged."""
     obj = np.array([[0.1, 0.8], [0.4, 0.2], [0.9, 0.5]])
     doubled = obj.copy()
@@ -95,7 +96,7 @@ def test_penalty_scales_out_for_dimensionless_losses():
     )
 
 
-def test_rejects_bad_penalty():
+def test_rejects_bad_reference():
     obj = np.array([[0.1, 0.5], [0.9, 0.5]])
     for bad in (0.0, -1.0, np.nan, np.inf):
         with pytest.raises(ValueError):
@@ -112,13 +113,13 @@ def test_rejects_bad_interpolation():
 def test_details_decomposition():
     obj = np.array([[0.1, 0.8], [0.4, 0.2], [0.9, 0.5]])
     d = double_pareto_hypervolume(obj, 1.0, details=True)
-    assert d["hv"] == pytest.approx(0.31)
-    assert d["dispersion"] == pytest.approx(0.69)
-    assert d["integral"] == pytest.approx(0.69)
+    assert d["hv"] == pytest.approx(0.475)
+    assert d["dispersion"] == pytest.approx(0.525)
+    assert d["integral"] == pytest.approx(0.525)
     assert d["coverage"] == pytest.approx(0.8)
     assert (d["eta_min"], d["eta_max"], d["n_front"]) == (0.1, 0.9, 3)
     assert d["front_min_loss"] == pytest.approx(0.2)
-    assert d["penalty"] == pytest.approx(1.0)
+    assert d["reference"] == pytest.approx(1.0)
 
 
 # --- step vs linear ------------------------------------------------------------------
@@ -144,34 +145,66 @@ def test_linear_rejected_for_multiple_loss_axes():
         double_pareto_hypervolume(obj, 1.0, interpolation="linear")
 
 
-# --- the reduction: the closed form IS the split-half hypervolume --------------------
+# --- the reduction: split-half hypervolume plus the two midpoint half-cells ----------
 
-def _split_reference(objectives, penalty):
-    """Two standard minimisation hypervolumes, split at the anchor, summed."""
-    eta, loss = objectives[:, 0], np.clip(objectives[:, 1], 0.0, penalty)
+def _split_reference(objectives, reference):
+    """Two standard minimisation hypervolumes, split at the minimum, summed."""
+    eta, loss = objectives[:, 0], np.clip(objectives[:, 1], 0.0, reference)
     anchor = eta[int(np.argmin(loss))]
     left, right = eta <= anchor, eta >= anchor
     total = hypervolume(
-        np.column_stack([eta[left], loss[left]]), np.array([anchor, penalty])
+        np.column_stack([eta[left], loss[left]]), np.array([anchor, reference])
     )
     total += hypervolume(
-        np.column_stack([-eta[right], loss[right]]), np.array([-anchor, penalty])
+        np.column_stack([-eta[right], loss[right]]), np.array([-anchor, reference])
     )
     return total
 
 
-def test_step_equals_split_hypervolume():
-    """The O(m) closed form is the standard hypervolume, not an approximation of it.
+def _midpoint_cells(objectives, reference):
+    """Area the step rule adds over the standard HV: half of each cell beside the minimum,
+    lowered from the neighbour's loss to the minimum loss."""
+    e = objectives[:, 0]
+    l = np.clip(objectives[:, 1], 0.0, reference)
+    a = int(np.argmin(l))
+    extra = 0.0
+    if a > 0:
+        extra += 0.5 * (e[a] - e[a - 1]) * (l[a - 1] - l[a])
+    if a < e.size - 1:
+        extra += 0.5 * (e[a + 1] - e[a]) * (l[a + 1] - l[a])
+    return extra
 
-    This is the lock on the ``max(l_i, l_i+1)`` staircase height: the ``min`` rule fails
-    this by up to 0.84. Keep it green.
-    """
+
+def test_step_equals_split_hypervolume_plus_midpoint_cells():
+    """The O(m) closed form is exactly the standard hypervolume plus the two half-cells
+    that give the minimum positive width. Keep it green."""
     for seed in range(300):
         obj = _random_front(seed)
         if obj.shape[0] < 2:
             continue
-        closed = double_pareto_hypervolume(obj, 1.0)  # box = P * span = 1
-        assert closed == pytest.approx(_split_reference(obj, 1.0), abs=1e-12)
+        closed = double_pareto_hypervolume(obj, 1.0)  # box = R * span = 1
+        expected = _split_reference(obj, 1.0) + _midpoint_cells(obj, 1.0)
+        assert closed == pytest.approx(expected, abs=1e-12)
+
+
+def test_improving_only_the_minimum_raises_the_indicator():
+    """The case the midpoint cells exist for: under plain max(l_i, l_i+1) it was flat."""
+    obj = np.array([[0.1, 0.8], [0.4, 0.2], [0.9, 0.5]])
+    better = obj.copy()
+    better[1, 1] = 0.05
+    assert double_pareto_hypervolume(better, 1.0) > double_pareto_hypervolume(obj, 1.0)
+    assert _split_reference(better, 1.0) == pytest.approx(_split_reference(obj, 1.0))
+
+
+def test_minimum_at_the_front_edge_splits_one_cell():
+    obj = np.array([[0.2, 0.1], [0.6, 0.4], [1.0, 0.7]])
+    # 0.2*1 (uncovered) + 0.2*0.1 + 0.2*0.4 + 0.4*0.7
+    assert double_pareto_hypervolume(obj, 1.0) == pytest.approx(1.0 - 0.58)
+
+
+def test_two_point_front():
+    obj = np.array([[0.0, 0.6], [1.0, 0.2]])
+    assert double_pareto_hypervolume(obj, 1.0) == pytest.approx(1.0 - (0.5 * 0.6 + 0.5 * 0.2))
 
 
 # --- the general N-dimensional hypervolume -------------------------------------------
@@ -241,32 +274,32 @@ def test_two_loss_axes_stays_bounded():
     assert 0.0 <= double_pareto_hypervolume(doubled, 1.0) <= 1.0
 
 
-# --- the default penalty ---------------------------------------------------------------
+# --- the default reference ---------------------------------------------------------------
 
 @pytest.mark.parametrize("metric", [nse, kge, kge_prime])
-def test_default_penalty_is_one_for_efficiency_metrics(metric, rng):
+def test_default_reference_is_one_for_efficiency_metrics(metric, rng):
     """loss = 1 - value is dimensionless, so P = 1 is the metric-value-0 no-skill line."""
     y = rng.gamma(2.0, 1.0, 400)
-    assert default_hv_penalty(metric, y) == 1.0
+    assert default_hv_reference(metric, y) == 1.0
 
 
-def test_default_penalty_for_error_metrics(rng):
+def test_default_reference_for_error_metrics(rng):
     y = rng.gamma(2.0, 1.0, 400)
-    assert default_hv_penalty(mse, y) == pytest.approx(np.var(y))
-    assert default_hv_penalty(rmse, y) == pytest.approx(np.std(y))
-    assert default_hv_penalty(mae, y) == pytest.approx(np.mean(np.abs(y - y.mean())))
+    assert default_hv_reference(mse, y) == pytest.approx(np.var(y))
+    assert default_hv_reference(rmse, y) == pytest.approx(np.std(y))
+    assert default_hv_reference(mae, y) == pytest.approx(np.mean(np.abs(y - y.mean())))
 
 
-def test_default_penalty_is_nses_denominator(rng):
-    """nse.loss == mse.loss / default_hv_penalty(mse, y) — the two branches are one rule."""
+def test_default_reference_is_nses_denominator(rng):
+    """nse.loss == mse.loss / default_hv_reference(mse, y) — the two branches are one rule."""
     y = rng.gamma(2.0, 1.0, 300)
     sim = y[:, None] + rng.standard_normal((300, 5))
     assert nse.loss(sim, y) == pytest.approx(
-        mse.loss(sim, y) / default_hv_penalty(mse, y)
+        mse.loss(sim, y) / default_hv_reference(mse, y)
     )
 
 
-def test_default_penalty_never_returns_the_degenerate_kge_value():
+def test_default_reference_never_returns_the_degenerate_kge_value():
     """The trap the analytic branch avoids.
 
     A constant simulation has zero variance, so Pearson r is 0/0 and KGE' gamma is x/0.
@@ -283,13 +316,13 @@ def test_default_penalty_never_returns_the_degenerate_kge_value():
             value = metric.loss(const, y)
             assert np.isnan(value) or value > 1e10 or value == pytest.approx(np.sqrt(2))
             seen.add("nan" if np.isnan(value) else "huge" if value > 1e10 else "sqrt2")
-            assert default_hv_penalty(metric, y) == 1.0
+            assert default_hv_reference(metric, y) == 1.0
     assert {"nan", "huge"} <= seen  # both failure modes really do occur
 
 
-def test_default_penalty_honours_an_explicit_predictor(rng):
+def test_default_reference_honours_an_explicit_predictor(rng):
     y = rng.gamma(2.0, 1.0, 200)
-    assert default_hv_penalty(mse, y, predictor=0.0) == pytest.approx(np.mean(y**2))
+    assert default_hv_reference(mse, y, predictor=0.0) == pytest.approx(np.mean(y**2))
 
 
 # --- clipped_fraction: making a too-tight ceiling visible ----------------------------
@@ -383,6 +416,6 @@ def test_space_is_validated():
 def test_linear_space_is_the_default_and_unchanged():
     """Guard: the space switch must not perturb the existing numbers."""
     obj = np.array([[0.1, 0.8], [0.4, 0.2], [0.9, 0.5]])
-    assert double_pareto_hypervolume(obj, 1.0) == pytest.approx(0.31)
-    assert double_pareto_hypervolume(obj, 1.0, space="linear") == pytest.approx(0.31)
+    assert double_pareto_hypervolume(obj, 1.0) == pytest.approx(0.475)
+    assert double_pareto_hypervolume(obj, 1.0, space="linear") == pytest.approx(0.475)
     assert double_pareto_hypervolume(obj, 1.0, details=True)["space"] == "linear"

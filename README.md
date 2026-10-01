@@ -23,7 +23,7 @@ The public interface is a **scikit-learn regressor**, so it drops into `Pipeline
 | Area | What you get |
 |---|---|
 | Estimator | `GPURegressor` — `fit` / `predict` (point) / `predict_quantiles` (bands), sklearn-compatible |
-| Forward models | tiny `MLPModel`, hydrological `GR4JModel`, external `HYPEModel` (SMHI HYPE executable, driven by your own forcing DataFrames), or **bring your own** `BaseForwardModel` |
+| Forward models | tiny `MLPModel`, hydrological `GR4JModel`, or **bring your own** `BaseForwardModel` |
 | Error metrics | `nse`, `kge`, `kge_prime`, `mae`, `mse`, `rmse` — fast, vectorised over the population, + Lp regularisation |
 | Uncertainty | `ParetoEnsemble` post-convergence estimator (inverse-CDF, band aggregation) |
 | Model selection | cross-validation, `GridSearchCV`, and **early stopping** on the held-out double-Pareto hypervolume |
@@ -102,7 +102,7 @@ scores = cross_val_score(GPURegressor(random_state=0), X, y,
 
 # search nested model / regularisation hyper-parameters
 search = GridSearchCV(GPURegressor(model=MLPModel(), random_state=0),
-                      {"model__n_hidden": [4, 8], "reg_lambda": [0.0, 1e-3]},
+                      {"model__n_hidden": [4, 8], "model__reg_lambda": [0.0, 1e-3]},
                       cv=TimeSeriesSplit(3))
 ```
 
@@ -141,8 +141,6 @@ foresight_gpu/     core package — a general sklearn regressor
   estimator.py     GPURegressor
   ensemble.py      ParetoEnsemble (fitted artifact)
   models/          BaseForwardModel, MLPModel, GR4JModel, MLPModelOpenCL (stub)
-    hype/          HYPEModel: the SMHI HYPE executable as a forward model,
-                   driven by forcing you pass in (DataFrames or file paths)
   metrics/         fast vectorised metrics + Lp regularisation + Renard diagnostics
   domination/      double-Pareto sorting + hypervolume indicator (seam for >2 objectives)
   optimizers/      MOPSO

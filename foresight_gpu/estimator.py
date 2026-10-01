@@ -4,12 +4,12 @@ The estimator owns the optimisation loop (so it can early-stop between generatio
 together a forward model, an error metric, a MOPSO optimiser, the double-Pareto sorter and,
 after convergence, a :class:`~foresight_gpu.ensemble.ParetoEnsemble`.
 
-Two knobs that are easy to conflate:
-
-* ``metric``  — the per-particle **training** loss that drives the Pareto front.
-* ``scoring`` — the held-out **probabilistic** criterion for early stopping / model selection.
+``metric`` is the per-particle **training** loss that drives the Pareto front. Early
+stopping always monitors the **validation hypervolume** of the front; the probabilistic
+scorers in :mod:`foresight_gpu.scoring` are for ``cross_val_score`` / ``GridSearchCV``.
 """
 
+import time
 import warnings
 
 import numpy as np
@@ -17,18 +17,20 @@ from sklearn.base import BaseEstimator, RegressorMixin, clone
 from sklearn.utils.validation import check_array, check_is_fitted, check_X_y
 
 from .domination import (
-    DEFAULT_HV_LOG_PENALTY,
-    DEFAULT_HV_PENALTY,
+    DEFAULT_HV_LOG_REFERENCE,
+    DEFAULT_HV_REFERENCE,
+    HV_REFERENCE_MARGIN,
     DoubleParetoSorter,
-    default_hv_penalty,
+    default_hv_reference,
+    double_pareto_hypervolume,
+    reference_nadir,
 )
-from .ensemble import DEFAULT_QUANTILES, ParetoEnsemble
+from .ensemble import DEFAULT_QUANTILES, ParetoEnsemble, _warn_if_clipped
 from .metrics import get_metric
 from .metrics.exceedance import non_exceedance
-from .metrics.regularization import lp_penalty
 from .models import MLPModel
 from .optimizers import MOPSO, evolve
-from .scoring import score_ensemble
+from .scoring import probabilistic_diagnostics
 from .utils.screening import prepare_arrays, screen_initial_population
 
 _BAD_LOSS = 1e3  # log10-loss assigned to non-finite (failed) evaluations
@@ -96,6 +98,87 @@ def _log_loss(loss):
     return np.where(np.isnan(out) | (out == np.inf), _BAD_LOSS, out)
 
 
+def _early_stopping_state(scores, tol):
+    """Replay the patience rule over a whole score series -> ``(best_idx, no_improve)``.
+
+    Run on the full series at every check because an adaptive reference rescores earlier
+    checks, which can move the best one. ``best_idx`` is ``None`` while no score is finite.
+    While the best score is still ``<= 0`` the counter is held: a front that has not beaten
+    the reference anywhere has no gradient to stop on.
+    """
+    best, best_score, no_improve = None, -np.inf, 0
+    for i, s in enumerate(scores):
+        if np.isfinite(s) and s > best_score + tol:
+            best, best_score, no_improve = i, s, 0
+        elif best_score > 0.0:
+            no_improve += 1
+    return best, no_improve
+
+
+def _prune_candidates(kept, scores, intercepts, best, tol):
+    """Drop kept ensembles that :func:`_early_stopping_state` can never select again.
+
+    Valid under an adaptive reference only. With ``u = 1/R`` (non-increasing) and nothing
+    clipped, check k scores ``s_k(u) = a_k - b_k u``; ``a_k`` is ``intercepts[k]``. Two lines
+    that order the same way at ``u = 0`` and at the current ``u`` order that way on the whole
+    remaining interval, so k is dead if
+
+    * an earlier i has ``a_i >= a_k`` and ``s_i >= s_k``: the replay's best is always
+      ``>= s_i - tol``, so k never clears it by ``tol``;
+    * a later j has ``a_j > a_k + tol`` and ``s_j > s_k + tol``: if k were best when j
+      arrives, j replaces it, and the best never moves back.
+    """
+    s, a = np.asarray(scores, dtype=float), np.asarray(intercepts, dtype=float)
+    for k in list(kept):
+        if k == best:
+            continue
+        earlier = (a[:k] >= a[k]) & (s[:k] >= s[k])
+        later = (a[k + 1:] > a[k] + tol) & (s[k + 1:] > s[k] + tol)
+        if not np.isfinite(s[k]) or earlier.any() or later.any():
+            del kept[k]
+
+
+def _front_points(ensemble, sims, y, metric):
+    """Front-0 ``(eta, loss)`` of ``ensemble`` on simulations already in hand, eta-ordered."""
+    eta, loss, front = ensemble._front_from_sims(sims, y, metric)
+    front = front[np.argsort(eta[front], kind="stable")]
+    return eta[front], loss[front]
+
+
+def _diagnose(ensemble, sims, iteration):
+    """One ``diagnostics_`` row: alpha, pi and CRPS per side (``sims``: side -> (sims, y))."""
+    row = {"iteration": iteration, "retained": False}
+    for side, (s, y) in sims.items():
+        diag = probabilistic_diagnostics(ensemble, ensemble._bands_from_sims(s), y)
+        row.update({f"{side}_{k}": v for k, v in diag.items()})
+    return row
+
+
+_HV_COLUMN = ("HV", "hv", "{:10.4f}")
+_DIAG_COLUMNS = (
+    ("alpha", "reliability", "{:12.3f}"),
+    ("pi", "resolution", "{:11.4g}"),
+    ("CRPS", "crps", "{:12.4g}"),
+)
+
+
+def _format_header(sides, columns):
+    cols = [f"{side.capitalize()} {label}" for label, _, _ in columns for side in sides]
+    widths = [len(fmt.format(0.0)) for _, _, fmt in columns for _ in sides]
+    body = "".join(f"{c:>{w + 1}}" for c, w in zip(cols, widths))
+    return f"{'Iter':>6}{body}{'Front':>7}{'Elapsed':>9}"
+
+
+def _format_row(row, sides, columns, new_best, elapsed):
+    cells = []
+    for _, key, fmt in columns:
+        for side in sides:
+            mark = "*" if new_best and key == "hv" and side == "val" else " "
+            cells.append(fmt.format(row[f"{side}_{key}"]) + mark)
+    front = row[f"{sides[-1]}_n_front"]
+    return f"{row['iteration']:>6}{''.join(cells)}{front:>7}{elapsed:>8.1f}s"
+
+
 class GPURegressor(RegressorMixin, BaseEstimator):
     """Generalized Pareto Uncertainty regressor.
 
@@ -113,8 +196,6 @@ class GPURegressor(RegressorMixin, BaseEstimator):
         Maximum number of generations.
     quantiles : sequence of float or None
         Non-exceedance-probability bands. ``None`` -> :data:`DEFAULT_QUANTILES`.
-    reg_lambda, reg_p : float, int
-        L-p regularisation coefficient and norm order (WRR Eq. 2).
     force_positive : bool
         Clip predictions at zero.
     force_non_exceedance : float or None
@@ -133,45 +214,52 @@ class GPURegressor(RegressorMixin, BaseEstimator):
         Held-out fraction for the built-in split (chronological tail unless ``shuffle``).
         ``None`` (default) means no internal split. See the note on early stopping below.
     n_iter_no_change : int
-        Number of checks without improvement before stopping.
+        Number of checks without improvement of the validation hypervolume before stopping.
     tol : float
-        Minimum improvement in the monitored score to count as progress.
-    scoring : str or callable
-        Early-stopping criterion (``"hypervolume"``, ``"reliability"``, ``"resolution"``,
-        ``"crps"`` or a callable ``scoring(ensemble, X, y)``).
-    hv_penalty : float or "climatology" or None
-        Hypervolume ceiling ``P`` — the price of a unit of uncovered exceedance, in the
-        units of the loss **as seen in** ``hv_space``. ``None`` (default) takes the default
-        for that space: :data:`~foresight_gpu.domination.DEFAULT_HV_PENALTY` (100.0) for
-        ``"linear"``, :data:`~foresight_gpu.domination.DEFAULT_HV_LOG_PENALTY` (2.0) for
-        ``"log10"``. The linear default is a deliberate constant rather than a climatology:
-        GPU's extreme-η particles are *meant* to be biased, so they score below the no-skill
-        line by construction, and a tight ceiling clips away exactly the particles that give
-        the distribution its width. ``"climatology"`` restores the metric-derived ceiling
-        (see :func:`~foresight_gpu.domination.default_hv_penalty`). Raise it when the loss
-        carries large units — MAE on flows in the thousands sits above 100, which pins
-        ``hv`` at 0. The ensemble warns both when the whole front is clipped and when more
-        than :data:`~foresight_gpu.domination.HV_CLIP_WARN_FRACTION` of it is.
-    hv_penalty_scale : float
-        Multiplier on ``P``; raise it to penalise uncovered exceedance harder. It multiplies
-        whichever default the space selects, not 1.0.
+        Minimum improvement in the validation hypervolume to count as progress.
+    hv_reference : "adaptive" or float or "climatology"
+        Hypervolume reference point ``R`` (the ceiling; the price of a unit of uncovered
+        exceedance), in the units of the loss **as seen in** ``hv_space``.
+
+        * ``"adaptive"`` (default): ``R = HV_REFERENCE_MARGIN * nadir``, the nadir being the
+          worst front-0 loss over every check so far (training and validation separately).
+          ``R`` only moves up, and whenever it does every earlier check is **rescored**
+          under it before the patience rule is replayed, so the stopping decision always
+          compares fronts in one box. Nothing is ever clipped.
+        * float: a fixed reference. A warning fires when it clips the whole validation
+          front or more than :data:`~foresight_gpu.domination.HV_CLIP_WARN_FRACTION` of it.
+        * ``"climatology"``: fixed, from
+          :func:`~foresight_gpu.domination.default_hv_reference`.
+    hv_reference_scale : float
+        Multiplier on ``R`` in every mode (on top of the adaptive margin).
     hv_interpolation : {"step", "linear"}
         How the front is integrated between consecutive particles.
     hv_space : {"linear", "log10"}
-        Objective space the front is integrated on. ``"log10"`` clips ``log10(loss)`` to a
-        symmetric ``[-P, P]`` box, which spreads the low-loss region that the linear axis
-        compresses — measured 6.9x more usable ``hv`` range on the same run — and lets ``P``
-        be a small readable number (``P=2`` is a raw loss of 100).
+        Objective space the front is integrated on. ``"log10"`` integrates ``log10(loss)``
+        in a symmetric ``[-R, R]`` box, which spreads the low-loss region that the linear
+        axis compresses — measured 6.9x more usable ``hv`` range on the same run.
     check_every : int
-        Generations between early-stopping checks.
+        Generations between checks: one ``history_`` entry (hypervolume) and one
+        early-stopping decision per check. Checks are cheap (one validation forward), so
+        1-5 is reasonable; keep the patience window ``check_every * n_iter_no_change`` in
+        generations roughly constant when changing it.
+    diagnostics_every : int or None
+        Generations between ``diagnostics_`` rows (reliability alpha, resolution pi and CRPS
+        on training and validation). ``None`` (default) computes them only for the retained
+        model. Each row costs a band aggregation over the training rows, several times a
+        check, so ~``n_iter / 40`` (10 at the default ``n_iter``) gives smooth curves. A
+        multiple of ``check_every`` shares the check's validation forward.
     shuffle : bool
         Shuffle before the validation split (default ``False`` — correct for time series).
     random_state : int or None
         Seed for reproducibility.
     n_jobs : int
         Reserved for parallel model evaluation (currently unused by the NumPy backend).
-    verbose : int
-        Verbosity.
+    verbose : int or bool
+        Print progress. Rows follow ``diagnostics_every`` (hypervolume plus alpha, pi and
+        CRPS), or every check when it is ``None`` (hypervolume only). Printing never changes
+        what is computed or stored. A row off the check grid shows the hypervolume as seen
+        live; ``history_`` holds the rescored check values.
 
     Attributes
     ----------
@@ -182,12 +270,25 @@ class GPURegressor(RegressorMixin, BaseEstimator):
     best_iteration_ : int
         Generation whose ensemble was retained (early stopping).
     history_ : list of dict
-        Per-check diagnostics.
+        The early-stopping record: one entry per check (every ``check_every`` generations
+        and the last), with or without validation data. Keys: ``iteration``, ``min_loss``,
+        ``space`` and, per side (``train_*`` always, ``val_*`` with early stopping), ``hv``,
+        ``coverage``, ``clipped_fraction``, ``n_front``, ``reference`` (in force at that
+        check), ``eta`` and ``loss`` (the front-0 points scored). ``*_hv`` is rescored
+        whenever the adaptive reference moves, so it is always on the final reference.
+    diagnostics_ : list of dict
+        One row per ``diagnostics_every`` generation (and the last), plus the retained
+        model's iteration, sorted by ``iteration``. Keys: ``iteration``, ``retained``
+        (``True`` on the row of ``best_iteration_``) and ``{train,val}_{reliability,
+        resolution,crps}``. Reference-free, so never rescored. Join with ``history_`` on
+        ``iteration``: ``pd.DataFrame(gpu.history_)`` and ``pd.DataFrame(gpu.diagnostics_)``
+        are both plain tables (see :func:`~foresight_gpu.utils.plotting.plot_history`).
     early_stopping_ : bool
         Whether early stopping ran, resolved from the data (see :meth:`fit`).
-    hv_penalty_ : float or None
-        The ceiling ``P`` actually used, when ``scoring="hypervolume"``, in ``hv_space``
-        units.
+    hv_reference_ : float or None
+        The final reference ``R`` of the monitored side (validation, else training), in
+        ``hv_space`` units. Also stored on ``ensemble_``, so
+        ``score_hypervolume(X_val, y_val)`` equals ``history_[best]["val_hv"]``.
 
     Notes
     -----
@@ -204,21 +305,20 @@ class GPURegressor(RegressorMixin, BaseEstimator):
     """
 
     def __init__(self, model=None, metric="nse", optimizer=None, population=1000,
-                 n_iter=400, quantiles=None, reg_lambda=0.0, reg_p=1,
-                 force_positive=False, force_non_exceedance=None, band_width=0.025,
+                 n_iter=400, quantiles=None, force_positive=False,
+                 force_non_exceedance=None, band_width=0.025,
                  min_models=1, screen=False, screen_oversample=3, warm_start=False,
-                 validation_fraction=None, n_iter_no_change=10,
-                 tol=1e-4, scoring="hypervolume", hv_penalty=None, hv_penalty_scale=1.0,
-                 hv_interpolation="step", hv_space="linear", check_every=5, shuffle=False,
-                 random_state=None, n_jobs=1, verbose=0):
+                 validation_fraction=None, n_iter_no_change=10, tol=1e-4,
+                 hv_reference="adaptive", hv_reference_scale=1.0,
+                 hv_interpolation="step", hv_space="linear", check_every=5,
+                 diagnostics_every=None, shuffle=False, random_state=None, n_jobs=1,
+                 verbose=0):
         self.model = model
         self.metric = metric
         self.optimizer = optimizer
         self.population = population
         self.n_iter = n_iter
         self.quantiles = quantiles
-        self.reg_lambda = reg_lambda
-        self.reg_p = reg_p
         self.force_positive = force_positive
         self.force_non_exceedance = force_non_exceedance
         self.band_width = band_width
@@ -229,12 +329,12 @@ class GPURegressor(RegressorMixin, BaseEstimator):
         self.validation_fraction = validation_fraction
         self.n_iter_no_change = n_iter_no_change
         self.tol = tol
-        self.scoring = scoring
-        self.hv_penalty = hv_penalty
-        self.hv_penalty_scale = hv_penalty_scale
+        self.hv_reference = hv_reference
+        self.hv_reference_scale = hv_reference_scale
         self.hv_interpolation = hv_interpolation
         self.hv_space = hv_space
         self.check_every = check_every
+        self.diagnostics_every = diagnostics_every
         self.shuffle = shuffle
         self.random_state = random_state
         self.n_jobs = n_jobs
@@ -264,6 +364,7 @@ class GPURegressor(RegressorMixin, BaseEstimator):
         ``sklearn.set_config(enable_metadata_routing=True)`` these also become routable
         params that must be requested explicitly.
         """
+        t0 = time.perf_counter()
         X, y = _check_X_y_allow_nan(X, y)
         self.n_features_in_ = X.shape[1]
         # the rng generates reproducible random numbers for the training (For operational use it should be None)
@@ -300,68 +401,157 @@ class GPURegressor(RegressorMixin, BaseEstimator):
                 )
             simulations, fit = evaluate(population)
 
-        # Resolved once and frozen: hv = 1 - D/P is only comparable between checks if P is
-        # the same box both times. A P that tracked the worst particle would report
-        # improvement whenever the swarm found something worse.
-        penalty = self._resolve_penalty(
-            metric, y_val if y_val is not None else y_tr, float(np.mean(y_tr))
-        )
+        # Per side: ``fixed`` is a float, or None for adaptive; ``reference`` is the R in
+        # force (adaptive starts at 0 and is raised by the first check).
+        sides = ("train", "val") if enabled else ("train",)
+        mean_tr = float(np.mean(y_tr))
+        fixed = {"train": self._resolve_reference(metric, y_tr, mean_tr)}
+        if enabled:
+            fixed["val"] = self._resolve_reference(metric, y_val, mean_tr)
+        reference = {side: fixed[side] or 0.0 for side in sides}
 
         make_ensemble = lambda pop, ft: ParetoEnsemble(  # noqa: E731
             model, model.search_transform(pop), ft[:, 0],
             quantiles, self.band_width, self.min_models, self.force_positive,
-            metric, penalty, self.hv_interpolation, self.hv_space,
+            metric, None, self.hv_interpolation, self.hv_space,
         )
 
-        # The scorer contract returns a float, so the hypervolume path asks the ensemble for
-        # the decomposition instead — purely to enrich history_, not to compute it differently.
-        use_hv = not callable(self.scoring) and str(self.scoring) == "hypervolume"
+        every = self.diagnostics_every
+        columns = (_HV_COLUMN,) + (_DIAG_COLUMNS if every else ())
+        if self.verbose:
+            print(_format_header(sides, columns), flush=True)
 
-        best_ensemble, best_score, best_iter, no_improve = None, -np.inf, 0, 0
-        history, last_iter = [], -1
+        # kept: check index -> candidate ensemble that could still be restored.
+        # intercepts: per check, val hv as R -> inf (see _prune_candidates).
+        history, diagnostics, kept, intercepts = [], [], {}, []
+        best, no_improve, last_iter, stopped = None, 0, -1, False
         for it in range(self.n_iter):
             population, fit, simulations, _ = evolve(
                 optimizer, sorter, population, fit, simulations, evaluate, penalize
             )
             last_iter = it
-            if enabled and (it % self.check_every == 0 or it == self.n_iter - 1):
-                candidate = make_ensemble(population, fit)
-                if use_hv:
-                    parts = candidate.score_hypervolume(X_val, y_val, details=True)
-                    score = parts["hv"]
-                else:
-                    score = score_ensemble(candidate, X_val, y_val, self.scoring)
-                    parts = {}
-                history.append(
-                    {"iteration": it, "score": float(score),
-                     "min_loss": float(np.nanmin(fit[:, 1])), **parts}
-                )
-                if np.isfinite(score) and score > best_score + self.tol:
-                    best_ensemble, best_score, best_iter = candidate, score, it
-                    no_improve = 0
-                elif use_hv and best_score <= 0.0:
-                    # Nothing has beaten the ceiling anywhere yet, so the indicator is
-                    # pinned at its floor and offers no gradient to stop on. Gated on
-                    # use_hv because the other scorers are not floored at zero -- negated
-                    # CRPS is always < 0, and an ungated guard would never let it stop.
-                    pass
-                else:
-                    no_improve += 1
-                    if no_improve >= self.n_iter_no_change:
-                        break
+            last = it == self.n_iter - 1
+            is_check = it % self.check_every == 0 or last
+            is_diag = bool(every) and (it % every == 0 or last)
+            show = bool(self.verbose) and (is_diag or (is_check and not every))
+            if not (is_check or is_diag):
+                continue
+
+            candidate = make_ensemble(population, fit)
+            # At most one forward per generation: training reuses the population's cached
+            # simulations; validation is simulated once for fronts and bands alike.
+            sims = {"train": (simulations, y_tr)}
+            if enabled:
+                sims["val"] = (candidate._simulate(X_val)[0], y_val)
+            if is_check or show:
+                fronts = {side: _front_points(candidate, *sims[side], metric)
+                          for side in sides}
+
+            previous, new_best, moved = best, False, {}
+            if is_check:
+                entry = {"iteration": it, "min_loss": float(np.nanmin(fit[:, 1])),
+                         "space": self.hv_space}
+                for side in sides:
+                    eta, loss = fronts[side]
+                    old = self._raise_reference(reference, fixed, side, loss, history)
+                    if old is not None:
+                        moved[side] = old
+                    parts = self._hv(eta, loss, reference[side])
+                    entry.update({f"{side}_{k}": parts[k] for k in
+                                  ("hv", "coverage", "clipped_fraction", "n_front")})
+                    entry.update({f"{side}_reference": reference[side],
+                                  f"{side}_eta": eta, f"{side}_loss": loss})
+                    if side == "val" and fixed["val"] is not None:
+                        _warn_if_clipped(parts, metric)
+                history.append(entry)
+
+                if enabled:
+                    eta, loss = fronts["val"]
+                    # Exact while nothing is clipped: hv is then linear in 1/R.
+                    hv2 = self._hv(eta, loss, 2.0 * reference["val"])["hv"]
+                    intercepts.append(2.0 * hv2 - entry["val_hv"])
+                    scores = [h["val_hv"] for h in history]
+                    best, no_improve = _early_stopping_state(scores, self.tol)
+                    new_best = best == len(history) - 1
+                    kept[len(history) - 1] = candidate
+                    if fixed["val"] is None:
+                        _prune_candidates(kept, scores, intercepts, best, self.tol)
+                    else:
+                        kept = {best: kept[best]} if best is not None else {}
+                    if best is not None and best not in kept:
+                        raise RuntimeError(f"Best check {best} was pruned (bug).")
+                    stopped = no_improve >= self.n_iter_no_change
+
+            if is_diag:
+                diagnostics.append(_diagnose(candidate, sims, it))
+
+            if self.verbose:
+                for side, old in moved.items():
+                    note = ""
+                    if side == "val" and best != previous and best is not None:
+                        note = f"; best is now iteration {history[best]['iteration']}"
+                    print(f"  -- {side} reference {old:.4g} -> {reference[side]:.4g}: "
+                          f"earlier checks rescored{note}", flush=True)
+                if show:
+                    row = {"iteration": it}
+                    for side in sides:     # live hv off the check grid; same values on it
+                        parts = self._hv(*fronts[side], reference[side])
+                        row.update({f"{side}_hv": parts["hv"],
+                                    f"{side}_n_front": parts["n_front"]})
+                    if is_diag:
+                        row.update(diagnostics[-1])
+                    print(_format_row(row, sides, columns, new_best,
+                                      time.perf_counter() - t0), flush=True)
+            if stopped:
+                break
 
         _warn_if_exceedance_collapsed(fit[:, 0], model)
 
-        if enabled and best_ensemble is not None:
-            self.ensemble_ = best_ensemble
-            self.best_iteration_ = best_iter
+        restored = enabled and best is not None
+        if restored:
+            self.ensemble_ = kept[best]
+            self.best_iteration_ = history[best]["iteration"]
         else:
             self.ensemble_ = make_ensemble(population, fit)
             self.best_iteration_ = last_iter
+        monitored = "val" if enabled else "train"
+        self.hv_reference_ = reference[monitored] if history else fixed[monitored]
+        self.ensemble_.hv_reference = self.hv_reference_
         self.n_iter_ = last_iter + 1
         self.history_ = history
         self.early_stopping_ = enabled
-        self.hv_penalty_ = penalty
+
+        # The retained model always gets a diagnostics row. A restored ensemble needs its
+        # own forward; the final population's simulations are already cached.
+        retained = next((d for d in diagnostics if d["iteration"] == self.best_iteration_),
+                        None)
+        if retained is None and last_iter >= 0:
+            sims = {"train": (self.ensemble_._simulate(X_tr)[0] if restored
+                              else simulations, y_tr)}
+            if enabled:
+                sims["val"] = (self.ensemble_._simulate(X_val)[0], y_val)
+            retained = _diagnose(self.ensemble_, sims, self.best_iteration_)
+            diagnostics.append(retained)
+            diagnostics.sort(key=lambda d: d["iteration"])
+        if retained is not None:
+            retained["retained"] = True
+        self.diagnostics_ = diagnostics
+
+        if self.verbose:
+            if not enabled:
+                print(f"Finished {self.n_iter_} iterations (no validation data, no early "
+                      f"stopping).", flush=True)
+            elif best is not None:
+                why = (f"Early stopping at iteration {last_iter}: no val hv improvement "
+                       f"> {self.tol:g} in {no_improve} checks" if stopped
+                       else f"Finished {self.n_iter_} iterations")
+                print(f"{why}; restored iteration {self.best_iteration_} "
+                      f"(val hv {history[best]['val_hv']:.4f}).", flush=True)
+            if retained is not None:
+                side = sides[-1]
+                print(f"Retained model, {side}: alpha {retained[f'{side}_reliability']:.3f}"
+                      f", pi {retained[f'{side}_resolution']:.4g}, CRPS "
+                      f"{retained[f'{side}_crps']:.4g}.", flush=True)
 
         # State retained for warm_start / introspection.
         self.model_, self.optimizer_ = model, optimizer
@@ -396,16 +586,16 @@ class GPURegressor(RegressorMixin, BaseEstimator):
         y = np.asarray(y, dtype=float).ravel()
         return self.ensemble_.predictive_pvalues(self._as_array(X), y)
 
-    def score_hypervolume(self, X, y, metric=None, *, penalty=None,
+    def score_hypervolume(self, X, y, metric=None, *, reference=None,
                           interpolation=None, space=None, details=False):
         """Double-Pareto hypervolume of the **fitted ensemble's** front on ``(X, y)``.
 
         In ``[0, 1]``, higher = better. Unlike the band-based scorers this measures the
         *front*, so it re-simulates the retained models rather than calling
         ``predict_quantiles``. Defaults come from the ensemble: the calibration ``metric``,
-        the resolved :attr:`hv_penalty_`, ``hv_interpolation`` and ``hv_space``. Pass
+        the resolved :attr:`hv_reference_`, ``hv_interpolation`` and ``hv_space``. Pass
         ``metric=`` to re-read the same front under any other metric, or ``space="log10"``
-        (with a matching ``penalty=``) to re-read it on a log loss axis.
+        (with a matching ``reference=``) to re-read it on a log loss axis.
 
         .. versionchanged:: 0.4.0
            Scores ``ensemble_`` — the front kept after any early-stopping rollback, i.e. the
@@ -414,7 +604,7 @@ class GPURegressor(RegressorMixin, BaseEstimator):
         """
         check_is_fitted(self)
         return self.ensemble_.score_hypervolume(
-            self._as_array(X), y, metric, penalty=penalty,
+            self._as_array(X), y, metric, reference=reference,
             interpolation=interpolation, space=space, details=details,
         )
 
@@ -463,43 +653,71 @@ class GPURegressor(RegressorMixin, BaseEstimator):
             tr_idx, val_idx = np.arange(n - n_val), np.arange(n - n_val, n)
         return Xc[tr_idx], yc[tr_idx], Xc[val_idx], yc[val_idx]
 
-    def _resolve_penalty(self, metric, y_eval, y_train_mean):
-        """Hypervolume ceiling ``P``, resolved once at fit time and stored on the ensemble.
+    def _resolve_reference(self, metric, y_eval, y_train_mean):
+        """Fixed hypervolume reference ``R`` for one side, or ``None`` for ``"adaptive"``.
 
-        ``"climatology"`` is evaluated on the window the indicator scores, with the
-        **training** mean as the constant predictor, so nothing leaks from held-out
-        observations. That is also why it is resolved here rather than on the ensemble: an
-        ensemble carries no training mean, so a self-referential climatology would leak.
+        ``"climatology"`` is evaluated on the window the side scores, with the **training**
+        mean as the constant predictor, so nothing leaks from held-out observations.
 
-        ``P`` carries the units of :attr:`hv_space`, so the default and the ``"climatology"``
-        value are both taken into that space. Under ``"log10"`` a climatology of exactly 1.0
-        (every ``greater_is_better`` metric) gives ``log10 -> 0``, which is not a valid
-        ceiling; that falls through the non-positive guard below rather than needing its own.
+        ``R`` carries the units of :attr:`hv_space`, so ``"climatology"`` is taken into that
+        space. Under ``"log10"`` a climatology of exactly 1.0 (every ``greater_is_better``
+        metric) gives ``log10 -> 0``, which is not a valid ceiling; that falls through the
+        non-positive guard below rather than needing its own.
         """
+        base = self.hv_reference
+        if isinstance(base, str) and base == "adaptive":
+            return None
         log_space = self.hv_space == "log10"
-        fallback = DEFAULT_HV_LOG_PENALTY if log_space else DEFAULT_HV_PENALTY
-        base = self.hv_penalty
-        if base is None:
-            base = fallback
-        elif isinstance(base, str):
+        fallback = DEFAULT_HV_LOG_REFERENCE if log_space else DEFAULT_HV_REFERENCE
+        if base is None or isinstance(base, str):
             if base != "climatology":
                 raise ValueError(
-                    f"hv_penalty must be a float or 'climatology', got {base!r}."
+                    f"hv_reference must be 'adaptive', a float or 'climatology', "
+                    f"got {base!r}."
                 )
-            base = default_hv_penalty(metric, y_eval, y_train_mean)
+            base = default_hv_reference(metric, y_eval, y_train_mean)
             if log_space:
                 with np.errstate(divide="ignore", invalid="ignore"):
                     base = np.log10(base)
-        penalty = float(self.hv_penalty_scale) * float(base)
-        if not np.isfinite(penalty) or penalty <= 0.0:
+        reference = float(self.hv_reference_scale) * float(base)
+        if not np.isfinite(reference) or reference <= 0.0:
             warnings.warn(
-                f"hypervolume penalty resolved to {penalty!r} for metric {metric} in "
-                f"{self.hv_space} space; falling back to {fallback}. Set hv_penalty= "
+                f"hypervolume reference resolved to {reference!r} for metric {metric} in "
+                f"{self.hv_space} space; falling back to {fallback}. Set hv_reference= "
                 f"explicitly.",
                 UserWarning,
             )
-            penalty = fallback
-        return penalty
+            reference = fallback
+        return reference
+
+    def _hv(self, eta, loss, reference):
+        """Hypervolume details of a stored front-0 (all points on it) under ``reference``."""
+        return double_pareto_hypervolume(
+            np.column_stack([eta, loss]), reference, front=np.arange(eta.size),
+            interpolation=self.hv_interpolation, space=self.hv_space, details=True,
+        )
+
+    def _raise_reference(self, reference, fixed, side, loss, history):
+        """Raise an adaptive reference to cover a new front's ``loss``.
+
+        When it moves, every earlier ``history`` entry of that side is rescored under it and
+        the old value is returned; otherwise ``None``. The rescoring is what makes an
+        adaptive R safe: hv of a front that never changes still grows with R, so checks are
+        only comparable on one reference.
+        """
+        if fixed[side] is not None:
+            return None
+        old = reference[side]
+        scale = float(self.hv_reference_scale) * HV_REFERENCE_MARGIN
+        nadir = reference_nadir(loss, self.hv_space)
+        reference[side] = max(old, scale * nadir, np.finfo(float).tiny)
+        if reference[side] <= old or not history:
+            return None
+        for h in history:
+            parts = self._hv(h[f"{side}_eta"], h[f"{side}_loss"], reference[side])
+            h[f"{side}_hv"] = parts["hv"]
+            h[f"{side}_clipped_fraction"] = parts["clipped_fraction"]
+        return old
 
     def _search_bounds(self, model):
         low_m, high_m = model.parameter_bounds(self.n_features_in_)
@@ -507,22 +725,18 @@ class GPURegressor(RegressorMixin, BaseEstimator):
         high_s = model.inverse_search_transform(high_m)
         return np.minimum(low_s, high_s), np.maximum(low_s, high_s)
 
-    def _make_loss_fn(self, model, metric, X, y, *, regularize=True):
+    def _make_loss_fn(self, model, metric, X, y):
         """Return ``core(params_search) -> (sims, eta, raw loss)``.
 
-        The **raw** loss is what the hypervolume integrates; ``_make_evaluate`` wraps this
-        to produce the sorter's log10 ranking axis.
+        The **raw** loss (metric + ``model.regularization``) is what the hypervolume
+        integrates; ``_make_evaluate`` wraps this to produce the sorter's log10 ranking axis.
         """
-        reg_lambda = self.reg_lambda if regularize else 0.0
-        reg_p = self.reg_p
-        reg_mask = model.regularizable_mask(self.n_features_in_) if reg_lambda > 0 else None
+        n_features = self.n_features_in_
 
         def core(params_search):
             params_model = model.search_transform(params_search)
             sims = model.forward(X, params_model)
-            loss = metric.loss(sims, y)
-            if reg_lambda > 0:
-                loss = loss + lp_penalty(params_model, reg_mask, reg_lambda, reg_p)
+            loss = metric.loss(sims, y) + model.regularization(params_model, n_features)
             return sims, non_exceedance(sims, y), loss
 
         return core

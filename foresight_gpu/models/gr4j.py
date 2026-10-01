@@ -55,10 +55,6 @@ class GR4JModel(BaseForwardModel):
     def parameter_bounds(self, n_features):
         return _BOUNDS_LOW.copy(), _BOUNDS_HIGH.copy()
 
-    def regularizable_mask(self, n_features):
-        # Physical parameters: L-p regularisation is not meaningful, so penalise none.
-        return np.zeros(4, dtype=bool)
-
     @staticmethod
     def _uh_ordinates(x4):
         """Unit-hydrograph ordinates UH1 ``[P, l1]`` and UH2 ``[P, l2]``."""

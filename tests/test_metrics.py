@@ -41,8 +41,7 @@ class TestForecastPerformanceEquivalence:
     """Our fast routines must agree numerically with the reference package."""
 
     def test_columnwise_equivalence(self, population_simulations):
-        # forecast_performance imports as `performance`; skip where it is unavailable.
-        fp = pytest.importorskip("performance.metrics.deterministic")
+        import forecast_performance.metrics.deterministic as fp
         pairs = [(nse, fp.nse), (kge, fp.kge), (kge_prime, fp.kge_prime),
                  (mae, fp.mae), (mse, fp.mse), (rmse, fp.rmse)]
         sim, obs = population_simulations
