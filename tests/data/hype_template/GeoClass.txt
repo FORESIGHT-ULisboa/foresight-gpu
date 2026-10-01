@@ -1,4 +1,0 @@
-!SLC	Landuse	Soiltype	cropid-main	cropid-2nd	rotation	vegetation_type	special_class	tile_depth	drain_depth	soil_layers	depth1	depth2	depth3	Comment
-1	1	1	0	0	0	1	0	0.0	1.0	3	0.25	0.5	1.0	
-2	2	2	0	0	0	1	0	0.0	1.0	3	0.25	0.5	1.0	
-3	3	3	0	0	0	1	0	0.0	1.0	3	0.25	0.5	1.0	
