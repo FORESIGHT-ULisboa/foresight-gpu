@@ -34,13 +34,3 @@ Simulations_*/
 .vscode/
 *.swp
 .DS_Store
-
-# Legacy source kept only during the port (delete before release)
-_legacy/
-
-# Notes for the oficial documentation
-potential_documentation/
-presentation/
-
-test.py
-/notebooks/scratch

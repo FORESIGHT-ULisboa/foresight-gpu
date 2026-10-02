@@ -1,4 +1,4 @@
-"""L-p regularisation of model parameters (WRR draft, Eq. 2).
+"""L-p regularisation of model parameters (manuscript in preparation, Eq. 2).
 
 Helper for a forward model's ``regularization``: a penalty on a masked subset of
 parameters, discouraging large weights (used by ``MLPModel``). Vectorised over the

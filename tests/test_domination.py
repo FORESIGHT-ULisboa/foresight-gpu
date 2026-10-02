@@ -7,7 +7,10 @@ from foresight_gpu.domination import DoubleParetoSorter
 
 
 def _reference_fronts(x0, x1):
-    """Reference double-Pareto sort (WRR draft, Appendix A). Permanent regression anchor."""
+    """Reference double-Pareto sort. Permanent regression anchor.
+
+    Manuscript in preparation, Appendix A.
+    """
     x0 = np.asarray(x0, dtype=float)
     x1 = np.asarray(x1, dtype=float)
     idx = np.lexsort((-((x0 - 0.5) ** 2), x1))

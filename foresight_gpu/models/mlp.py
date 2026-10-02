@@ -50,8 +50,8 @@ class MLPModel(BaseForwardModel):
 
         Inputs are **not** scaled here; use a ``Pipeline`` for those.
     reg_lambda, reg_p : float, int, optional
-        L-p regularisation coefficient and norm order (WRR Eq. 2) on the connection
-        weights (biases are not penalised). ``reg_lambda=0`` disables it.
+        L-p regularisation coefficient and norm order (manuscript in preparation, Eq. 2)
+        on the connection weights (biases are not penalised). ``reg_lambda=0`` disables it.
     """
 
     def __init__(self, n_hidden=8, activation="tanh", leaky_slope=0.01,

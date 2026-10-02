@@ -8,9 +8,10 @@ version = "0.8.0"
 description = "Generalized Pareto Uncertainty (GPU): a scikit-learn-style probabilistic regressor"
 readme = "README.md"
 license = { file = "LICENSE" }
-requires-python = ">=3.9"
+requires-python = ">=3.11"
 authors = [
-    { name = "FORESIGHT", email = "jose.matos@tecnico.ulisboa.pt" },
+    { name = "Rui Marinheiro", email = "ruismarinheiro@tecnico.ulisboa.pt" },
+    { name = "José Matos", email = "jose.matos@tecnico.ulisboa.pt" },
 ]
 keywords = [
     "uncertainty",
@@ -34,7 +35,7 @@ dependencies = [
     "matplotlib>=3.7",
     "scikit-learn>=1.3",
     "joblib>=1.3",
-    "forecast-performance @ git+https://github.com/FORESIGHT-ULisboa/forecast_performance",
+    "forecast-performance>=1.0.0",
 ]
 
 [project.urls]

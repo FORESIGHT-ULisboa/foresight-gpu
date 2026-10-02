@@ -8,9 +8,6 @@ from foresight_gpu import GPURegressor
 from foresight_gpu.models import MLPModel
 from foresight_gpu.scoring import make_gpu_scorer, reliability_scorer, score_ensemble
 
-# Re-pinned in 0.5.0: the default MLPModel no longer scales X/y (see AGENTS.md), so the
-# default estimator's predictions -- and hence this score -- legitimately moved.
-
 
 @pytest.fixture
 def data(rng):

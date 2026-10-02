@@ -31,23 +31,15 @@ The public interface is a **scikit-learn regressor**, so it drops into `Pipeline
 
 ## Installation
 
-**A · From source (development)**
+Requires Python ≥ 3.11.
 
-```bat
-conda env create -f environment.yml
-conda activate foresight_gpu
-python -m ipykernel install --user --name foresight_gpu --display-name "foresight_gpu"
-```
-
-Or with an existing environment:
-
-```bat
-pip install -e ".[dev]"
+```bash
+pip install git+https://github.com/FORESIGHT-ULisboa/foresight-gpu
 ```
 
 The install pulls the companion package
-[`forecast_performance`](https://github.com/FORESIGHT-ULisboa/forecast_performance) as a
-git dependency (used for richer diagnostics and to cross-check the fast metrics).
+[`forecast-performance`](https://github.com/FORESIGHT-ULisboa/forecast_performance) from
+PyPI (used for richer diagnostics and to cross-check the fast metrics).
 
 > **Windows / BLAS note.** The `foresight_gpu` core is BLAS-free (it uses `einsum`), so
 > fitting works everywhere. Plotting and scikit-learn helpers do use NumPy's LAPACK. If

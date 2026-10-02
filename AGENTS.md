@@ -12,8 +12,8 @@ data-driven, largely non-parametric way to turn a family of deterministic models
 population of parameter sets for a deterministic *forward model*, ranks them on a
 **double / mirrored Pareto front** over two objectives — *non-exceedance* (η) versus an
 *error metric* (ε) — and aggregates the surviving models by non-exceedance band into an
-estimate of the inverse conditional CDF (see the WRR draft, Eq. 4). Reliability and
-resolution are scored with the Renard et al. (2010) diagnostics.
+estimate of the inverse conditional CDF (manuscript in preparation, Eq. 4). Reliability
+and resolution are scored with the Renard et al. (2010) diagnostics.
 
 "GPU" is a double meaning: *Generalized Pareto Uncertainty* (the method) and *Graphics
 Processing Units* (an optional compute backend). **The core runs on NumPy.** OpenCL is a
@@ -405,13 +405,10 @@ leak into the engine.
 - Develop in the conda environment named **`foresight_gpu`** (`conda env create -f
   environment.yml`), used for the package, tests and notebooks (register it as a Jupyter
   kernel named `foresight_gpu`).
-- A machine with the full stack (incl. the `forecast_performance` / `performance` package)
-  has been seen at `C:\Users\<user>\.conda\envs\analise_desempenho\python.exe` — **path
-  differs per machine; resolve the env yourself, don't hard-code it.**
-- Setup: `pip install -e ".[dev]"` (also pulls the `forecast-performance` git dependency).
-  It is a **core** dependency and imports as `forecast_performance` (1.0.0; the old
-  `performance` module name is gone). CRPS is in every `diagnostics_` row, so nothing
-  guards the import.
+- Setup: `pip install -e ".[dev]"` (also pulls `forecast-performance` from PyPI). It is a
+  **core** dependency and imports as `forecast_performance` (≥1.0.0; the old `performance`
+  module name is gone). CRPS is in every `diagnostics_` row, so nothing guards the import.
+  It requires Python ≥3.11, which sets this package's floor.
 - Run tests: `pytest tests/ -v`.
 
 ## Style
@@ -431,13 +428,9 @@ leak into the engine.
 - Keep the sklearn estimator checks, the "three calling styles agree" metric tests, the CV
   and early-stopping tests, the domination-equivalence test, and the hypervolume reduction
   test (`test_step_equals_split_hypervolume_plus_midpoint_cells`) green.
-- **Known pre-existing failure:** `tests/test_cross_validation.py::test_cross_val_score_reliability`
-  pins `EXPECTED_RELIABILITY_SCORE` to values ~1e-3 away from what this environment produces.
-  It fails identically on `74d5d4b`, byte for byte, so it is an environment-pinning issue,
-  not a regression. It was useful as a control when refactoring the training path; note that
-  since 0.5.0 it now differs for **two** reasons — the environment, and the removal of the
-  default MLP's scaling — so it is no longer a clean control. `EXPECTED_R2_SCORE` in the same
-  file was re-pinned in 0.5.0 for the second reason alone.
+- The whole suite is expected to pass. Avoid pinning exact scores from stochastic fits:
+  they drift ~1e-3 across platforms and BLAS builds. Assert shape, finiteness and bounds,
+  or exact identities between code paths, instead.
 
 
 ## Important Notes

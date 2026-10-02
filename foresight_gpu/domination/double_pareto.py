@@ -1,4 +1,4 @@
-"""Double / mirrored Pareto sorting (WRR draft, Section 2.6 & Appendix A).
+"""Double / mirrored Pareto sorting (manuscript in preparation, Sec. 2.6 & App. A).
 
 The GPU objective space has two *mirrored* Pareto fronts: as exceedance moves away from
 0.5 in either direction the achievable error rises, so the ideal front is a convex curve

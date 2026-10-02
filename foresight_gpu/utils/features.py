@@ -14,7 +14,9 @@ from sklearn.base import BaseEstimator, TransformerMixin
 
 
 class PeriodicFeatures(TransformerMixin, BaseEstimator):
-    """Encode a cyclic column (e.g. day-of-year) as sin/cos pair (WRR Eq. 6).
+    """Encode a cyclic column (e.g. day-of-year) as sin/cos pair.
+
+    Manuscript in preparation, Eq. 6.
 
     Parameters
     ----------

@@ -4,7 +4,7 @@
 #   conda activate foresight_gpu
 #
 # The pip section installs the package in editable mode with its dev extras,
-# which also pulls the git dependency `forecast-performance`.
+# which also pulls `forecast-performance` from PyPI.
 name: foresight_gpu
 channels:
   - conda-forge

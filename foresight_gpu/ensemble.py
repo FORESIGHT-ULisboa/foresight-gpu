@@ -2,9 +2,9 @@
 
 After the optimiser converges, the retained front is a set of deterministic models, each
 with an **observed exceedance** on the training data. :class:`ParetoEnsemble` implements the
-GPU prediction rule (WRR draft, Eq. 4): to estimate the value at non-exceedance probability
-``p``, aggregate (median of) the models whose observed exceedance lies within ``band_width``
-of ``p``. Bands are then monotonically ordered and gaps interpolated in a custom log space so
+GPU prediction rule (manuscript in preparation, Eq. 4): to estimate the value at
+non-exceedance probability ``p``, aggregate (median of) the models whose observed exceedance
+lies within ``band_width`` of ``p``. Bands are then monotonically ordered and gaps interpolated in a custom log space so
 the result is a valid, sharp inverse CDF.
 
 This object is what :attr:`GPURegressor.ensemble_` holds; it is pickle-serialisable.
@@ -47,7 +47,10 @@ def band_bounds(quantiles, band_width):
 
 
 def aggregate_by_band(simulations, exceedances, bounds, min_models, force_positive):
-    """Median of the models whose exceedance falls in each band (WRR Eq. 4)."""
+    """Median of the models whose exceedance falls in each band.
+
+    Manuscript in preparation, Eq. 4.
+    """
     aggregated = np.full((simulations.shape[0], bounds.shape[1]), np.nan)
     for i in range(bounds.shape[1]):
         idx = np.where((exceedances >= bounds[0, i]) & (exceedances <= bounds[1, i]))[0]
@@ -180,9 +183,9 @@ class ParetoEnsemble:
         return agg[:, idx]
 
     def inverse_cdf(self, X, p):
-        """Value at a single non-exceedance probability ``p`` (WRR Eq. 4).
+        """Value at a single non-exceedance probability ``p``.
 
-        Post-processing (which needs >= 2 bands to order/interpolate) is skipped for a
+        Manuscript in preparation, Eq. 4. Post-processing (which needs >= 2 bands to order/interpolate) is skipped for a
         single level.
         """
         return self.predict_quantiles(X, quantiles=[p], post_process=False)[:, 0]
